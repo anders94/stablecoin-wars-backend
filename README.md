@@ -28,8 +28,8 @@ A backend service for tracking and comparing stablecoin metrics across multiple 
 
 ```bash
 # Clone the repository
-git clone <repo-url>
-cd stablecoin-wars
+git clone https://github.com/anders94/stablecoin-wars-backend.git
+cd stablecoin-wars-backend
 
 # Install dependencies
 npm install
