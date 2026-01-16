@@ -1,0 +1,38 @@
+{
+  "name": "stablecoin-wars",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "nodemon --exec ts-node src/index.ts",
+    "migrate:up": "db-migrate up",
+    "migrate:down": "db-migrate down",
+    "migrate:create": "db-migrate create",
+    "indexer": "ts-node src/indexer/worker.ts"
+  },
+  "keywords": ["stablecoin", "blockchain", "analytics"],
+  "author": "",
+  "license": "ISC",
+  "description": "Stablecoin analytics and comparison platform",
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "bull": "^4.16.5",
+    "db-migrate": "^0.11.14",
+    "db-migrate-pg": "^1.5.2",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.16.0",
+    "express": "^5.2.1",
+    "ioredis": "^5.9.2",
+    "pg": "^8.17.1",
+    "tronweb": "^6.1.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.0.9",
+    "@types/pg": "^8.16.0",
+    "nodemon": "^3.1.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
