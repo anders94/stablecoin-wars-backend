@@ -323,4 +323,4 @@ npm run migrate:create -- my-migration-name
 
 ## License
 
-ISC
+MIT
