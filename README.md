@@ -1,4 +1,4 @@
-# Stablecoin Wars
+# Stablecoin Wars - Backend
 
 A backend service for tracking and comparing stablecoin metrics across multiple blockchain networks. Track total supply, mints, burns, transactions, fees, and volume with support for flexible time-series aggregation.
 
