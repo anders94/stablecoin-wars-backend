@@ -124,15 +124,19 @@ async function main() {
         console.log(`  Queueing discovery for ${contract.stablecoin_name} on ${contract.network_name}`);
         const jobId = `discover-${contract.id}`;
 
-        // Remove existing job if it exists and is not active
+        // Check if job already exists
         const existingJob = await queue.getJob(jobId);
         if (existingJob) {
           const state = await existingJob.getState();
-          if (state !== 'active') {
-            console.log(`    Removing existing job ${jobId} (state: ${state})`);
+
+          // Remove failed or completed jobs so they can be retried
+          if (state === 'failed' || state === 'completed') {
+            console.log(`    Cleaning up ${state} job ${jobId}`);
             await existingJob.remove();
           } else {
-            console.log(`    Skipping removal of active job ${jobId}`);
+            // Skip active, waiting, or delayed jobs (let them continue)
+            console.log(`    Job ${jobId} already exists (state: ${state}), skipping`);
+            continue;
           }
         }
 
@@ -163,15 +167,19 @@ async function main() {
         console.log(`  Queueing sync for ${contract.stablecoin_name} on ${contract.network_name} (status: ${contract.status})`);
         const jobId = `sync-${contract.id}`;
 
-        // Remove existing job if it exists and is not active
+        // Check if job already exists
         const existingJob = await queue.getJob(jobId);
         if (existingJob) {
           const state = await existingJob.getState();
-          if (state !== 'active') {
-            console.log(`    Removing existing job ${jobId} (state: ${state})`);
+
+          // Remove failed or completed jobs so they can be retried
+          if (state === 'failed' || state === 'completed') {
+            console.log(`    Cleaning up ${state} job ${jobId}`);
             await existingJob.remove();
           } else {
-            console.log(`    Skipping removal of active job ${jobId}`);
+            // Skip active, waiting, or delayed jobs (let them continue)
+            console.log(`    Job ${jobId} already exists (state: ${state}), skipping`);
+            continue;
           }
         }
 
