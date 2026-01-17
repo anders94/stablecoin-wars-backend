@@ -21,9 +21,9 @@ async function main() {
 
   const queue = getIndexerQueue();
 
-  // Ensure queue is not paused from previous shutdown
-  await queue.resume(true); // Resume both locally and globally
-  console.log('Queue resumed and ready to process jobs');
+  // Keep queue paused during initialization to prevent race conditions
+  await queue.pause(true); // Pause both locally and globally
+  console.log('Queue paused for initialization');
 
   // Process discover-contract jobs
   queue.process('discover-contract', async (job) => {
@@ -124,11 +124,16 @@ async function main() {
         console.log(`  Queueing discovery for ${contract.stablecoin_name} on ${contract.network_name}`);
         const jobId = `discover-${contract.id}`;
 
-        // Remove existing job if it exists
+        // Remove existing job if it exists and is not active
         const existingJob = await queue.getJob(jobId);
         if (existingJob) {
-          console.log(`    Removing existing job ${jobId}`);
-          await existingJob.remove();
+          const state = await existingJob.getState();
+          if (state !== 'active') {
+            console.log(`    Removing existing job ${jobId} (state: ${state})`);
+            await existingJob.remove();
+          } else {
+            console.log(`    Skipping removal of active job ${jobId}`);
+          }
         }
 
         await queue.add('discover-contract', {
@@ -158,11 +163,16 @@ async function main() {
         console.log(`  Queueing sync for ${contract.stablecoin_name} on ${contract.network_name} (status: ${contract.status})`);
         const jobId = `sync-${contract.id}`;
 
-        // Remove existing job if it exists
+        // Remove existing job if it exists and is not active
         const existingJob = await queue.getJob(jobId);
         if (existingJob) {
-          console.log(`    Removing existing job ${jobId}`);
-          await existingJob.remove();
+          const state = await existingJob.getState();
+          if (state !== 'active') {
+            console.log(`    Removing existing job ${jobId} (state: ${state})`);
+            await existingJob.remove();
+          } else {
+            console.log(`    Skipping removal of active job ${jobId}`);
+          }
         }
 
         await queue.add('sync-contract', {
@@ -184,6 +194,10 @@ async function main() {
 
   // Run initialization
   await initializeContracts();
+
+  // Resume queue after initialization
+  await queue.resume(true); // Resume both locally and globally
+  console.log('Queue resumed and ready to process jobs');
 
   // Schedule periodic aggregation
   const AGGREGATION_INTERVAL = 60 * 60 * 1000; // 1 hour

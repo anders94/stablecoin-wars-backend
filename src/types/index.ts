@@ -26,12 +26,23 @@ export interface Network {
   created_at: Date;
 }
 
+export interface RpcEndpoint {
+  id: string;
+  url: string;
+  max_requests_per_minute: number;
+  description: string | null;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
 export interface Contract {
   id: string;
   stablecoin_id: string;
   network_id: string;
   contract_address: string;
-  rpc_endpoint: string;
+  rpc_endpoint: string;  // Kept for backwards compatibility during migration
+  rpc_endpoint_id: string;
   creation_block: number | null;
   creation_date: Date | null;
   is_active: boolean;
@@ -134,6 +145,18 @@ export interface CreateContractRequest {
   network_id: string;
   contract_address: string;
   rpc_endpoint: string;
+}
+
+export interface CreateRpcEndpointRequest {
+  url: string;
+  max_requests_per_minute?: number;
+  description?: string;
+}
+
+export interface UpdateRpcEndpointRequest {
+  max_requests_per_minute?: number;
+  is_active?: boolean;
+  description?: string;
 }
 
 export interface MetricsQueryParams {

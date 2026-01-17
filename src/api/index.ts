@@ -5,6 +5,7 @@ import networksRouter from './routes/networks';
 import contractsRouter from './routes/contracts';
 import metricsRouter from './routes/metrics';
 import syncRouter from './routes/sync';
+import rpcEndpointsRouter from './routes/rpcEndpoints';
 
 const app = express();
 
@@ -22,6 +23,7 @@ app.use('/api/networks', networksRouter);
 app.use('/api/contracts', contractsRouter);
 app.use('/api/metrics', metricsRouter);
 app.use('/api/sync', syncRouter);
+app.use('/api/rpc-endpoints', rpcEndpointsRouter);
 
 // Error handler
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {

@@ -3,18 +3,30 @@ import { createAdapter, BlockchainAdapter } from './adapters';
 import { transaction, queryOne, execute } from '../db';
 import { Contract, Network, SyncState, RESOLUTIONS, TransferEvent } from '../types';
 import { isShutdownRequested } from './worker';
+import { RateLimitService } from './rateLimit';
 
 // Number of blocks to process per batch
-const BLOCKS_PER_BATCH = 1000;
+// Set to 500 to stay under most RPC providers' limits (typically 800-2000)
+const BLOCKS_PER_BATCH = 500;
 
 // Seconds in a day (for daily metrics)
 const SECONDS_PER_DAY = 86400;
+
+// Rate limiter singleton
+const rateLimiter = new RateLimitService({
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6379'),
+  password: process.env.REDIS_PASSWORD,
+});
 
 interface ContractWithNetwork extends Contract {
   chain_type: 'evm' | 'tron' | 'solana';
   decimals: number;
   network_name: string;
   stablecoin_name: string;
+  rpc_endpoint_id: string;
+  rpc_endpoint: string;
+  max_requests_per_minute: number;
 }
 
 interface DailyMetrics {
@@ -33,10 +45,12 @@ interface DailyMetrics {
 export async function discoverContract(contractId: string): Promise<void> {
   // Get contract details
   const contract = await queryOne<ContractWithNetwork>(
-    `SELECT c.*, n.chain_type, n.name as network_name, s.decimals, s.name as stablecoin_name
+    `SELECT c.*, n.chain_type, n.name as network_name, s.decimals, s.name as stablecoin_name,
+            re.id as rpc_endpoint_id, re.url as rpc_endpoint, re.max_requests_per_minute
      FROM contracts c
      JOIN networks n ON c.network_id = n.id
      JOIN stablecoins s ON c.stablecoin_id = s.id
+     JOIN rpc_endpoints re ON c.rpc_endpoint_id = re.id
      WHERE c.id = $1`,
     [contractId]
   );
@@ -56,8 +70,12 @@ export async function discoverContract(contractId: string): Promise<void> {
   let adapter: BlockchainAdapter | null = null;
 
   try {
-    // Create adapter for chain type
-    adapter = await createAdapter(contract.chain_type, contract.rpc_endpoint);
+    // Create adapter for chain type with rate limiting
+    adapter = await createAdapter(contract.chain_type, contract.rpc_endpoint, {
+      rateLimiter,
+      endpointId: contract.rpc_endpoint_id,
+      maxRequestsPerMinute: contract.max_requests_per_minute,
+    });
 
     // Find contract creation block
     let creationBlock = contract.creation_block;
@@ -116,10 +134,12 @@ export async function discoverContract(contractId: string): Promise<void> {
 export async function syncContract(contractId: string): Promise<void> {
   // Get contract details
   const contract = await queryOne<ContractWithNetwork>(
-    `SELECT c.*, n.chain_type, n.name as network_name, s.decimals, s.name as stablecoin_name
+    `SELECT c.*, n.chain_type, n.name as network_name, s.decimals, s.name as stablecoin_name,
+            re.id as rpc_endpoint_id, re.url as rpc_endpoint, re.max_requests_per_minute
      FROM contracts c
      JOIN networks n ON c.network_id = n.id
      JOIN stablecoins s ON c.stablecoin_id = s.id
+     JOIN rpc_endpoints re ON c.rpc_endpoint_id = re.id
      WHERE c.id = $1`,
     [contractId]
   );
@@ -149,7 +169,12 @@ export async function syncContract(contractId: string): Promise<void> {
   let adapter: BlockchainAdapter | null = null;
 
   try {
-    adapter = await createAdapter(contract.chain_type, contract.rpc_endpoint);
+    // Create adapter for chain type with rate limiting
+    adapter = await createAdapter(contract.chain_type, contract.rpc_endpoint, {
+      rateLimiter,
+      endpointId: contract.rpc_endpoint_id,
+      maxRequestsPerMinute: contract.max_requests_per_minute,
+    });
 
     const currentBlock = await adapter.getCurrentBlockNumber();
     // Ensure last_synced_block is a number (PostgreSQL may return as string)
