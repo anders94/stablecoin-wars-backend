@@ -12,6 +12,8 @@ const SECONDS_PER_DAY = 86400;
 interface ContractWithNetwork extends Contract {
   chain_type: 'evm' | 'tron' | 'solana';
   decimals: number;
+  network_name: string;
+  stablecoin_name: string;
 }
 
 interface DailyMetrics {
@@ -28,11 +30,9 @@ interface DailyMetrics {
 }
 
 export async function discoverContract(contractId: string): Promise<void> {
-  console.log(`Discovering contract ${contractId}...`);
-
   // Get contract details
   const contract = await queryOne<ContractWithNetwork>(
-    `SELECT c.*, n.chain_type, s.decimals
+    `SELECT c.*, n.chain_type, n.name as network_name, s.decimals, s.name as stablecoin_name
      FROM contracts c
      JOIN networks n ON c.network_id = n.id
      JOIN stablecoins s ON c.stablecoin_id = s.id
@@ -43,6 +43,8 @@ export async function discoverContract(contractId: string): Promise<void> {
   if (!contract) {
     throw new Error(`Contract ${contractId} not found`);
   }
+
+  console.log(`Discovering ${contract.stablecoin_name} on ${contract.network_name}...`);
 
   // Update sync state to syncing
   await execute(
@@ -88,12 +90,12 @@ export async function discoverContract(contractId: string): Promise<void> {
       [creationBlock - 1, contractId]
     );
 
-    console.log(`Contract discovered. Creation block: ${creationBlock}`);
+    console.log(`${contract.stablecoin_name} on ${contract.network_name} discovered. Creation block: ${creationBlock}`);
 
     // Start syncing
     await syncContract(contractId);
   } catch (error) {
-    console.error(`Error discovering contract ${contractId}:`, error);
+    console.error(`Error discovering ${contract.stablecoin_name} on ${contract.network_name}:`, error);
     await execute(
       `UPDATE sync_state SET status = 'error', error_message = $1, updated_at = NOW() WHERE contract_id = $2`,
       [(error as Error).message, contractId]
@@ -107,11 +109,9 @@ export async function discoverContract(contractId: string): Promise<void> {
 }
 
 export async function syncContract(contractId: string): Promise<void> {
-  console.log(`Syncing contract ${contractId}...`);
-
   // Get contract details
   const contract = await queryOne<ContractWithNetwork>(
-    `SELECT c.*, n.chain_type, s.decimals
+    `SELECT c.*, n.chain_type, n.name as network_name, s.decimals, s.name as stablecoin_name
      FROM contracts c
      JOIN networks n ON c.network_id = n.id
      JOIN stablecoins s ON c.stablecoin_id = s.id
@@ -123,6 +123,8 @@ export async function syncContract(contractId: string): Promise<void> {
     throw new Error(`Contract ${contractId} not found`);
   }
 
+  console.log(`Syncing ${contract.stablecoin_name} on ${contract.network_name}...`);
+
   // Get current sync state
   const syncState = await queryOne<SyncState>(
     'SELECT * FROM sync_state WHERE contract_id = $1',
@@ -130,7 +132,7 @@ export async function syncContract(contractId: string): Promise<void> {
   );
 
   if (!syncState) {
-    throw new Error(`Sync state for contract ${contractId} not found`);
+    throw new Error(`Sync state for ${contract.stablecoin_name} on ${contract.network_name} not found`);
   }
 
   // Update status to syncing
@@ -147,7 +149,7 @@ export async function syncContract(contractId: string): Promise<void> {
     const currentBlock = await adapter.getCurrentBlockNumber();
     let fromBlock = syncState.last_synced_block + 1;
 
-    console.log(`Syncing from block ${fromBlock} to ${currentBlock}`);
+    console.log(`Syncing ${contract.stablecoin_name} on ${contract.network_name} from block ${fromBlock} to ${currentBlock}`);
 
     while (fromBlock <= currentBlock) {
       const toBlock = Math.min(fromBlock + BLOCKS_PER_BATCH - 1, currentBlock);
@@ -204,9 +206,9 @@ export async function syncContract(contractId: string): Promise<void> {
       [contractId]
     );
 
-    console.log(`Contract ${contractId} synced successfully`);
+    console.log(`${contract.stablecoin_name} on ${contract.network_name} synced successfully`);
   } catch (error) {
-    console.error(`Error syncing contract ${contractId}:`, error);
+    console.error(`Error syncing ${contract.stablecoin_name} on ${contract.network_name}:`, error);
     await execute(
       `UPDATE sync_state SET status = 'error', error_message = $1, updated_at = NOW() WHERE contract_id = $2`,
       [(error as Error).message, contractId]

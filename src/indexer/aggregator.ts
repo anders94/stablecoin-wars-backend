@@ -174,13 +174,19 @@ async function aggregatePeriod(
 
 // Run aggregation for all contracts
 export async function runFullAggregation(): Promise<void> {
-  const contracts = await query<{ id: string }>('SELECT id FROM contracts WHERE is_active = true');
+  const contracts = await query<{ id: string; network_name: string; stablecoin_name: string }>(
+    `SELECT c.id, n.name as network_name, s.name as stablecoin_name
+     FROM contracts c
+     JOIN networks n ON c.network_id = n.id
+     JOIN stablecoins s ON c.stablecoin_id = s.id
+     WHERE c.is_active = true`
+  );
 
   for (const contract of contracts) {
     try {
       await aggregateMetrics(contract.id);
     } catch (error) {
-      console.error(`Error aggregating metrics for contract ${contract.id}:`, error);
+      console.error(`Error aggregating metrics for ${contract.stablecoin_name} on ${contract.network_name}:`, error);
     }
   }
 }

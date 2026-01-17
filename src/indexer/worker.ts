@@ -16,14 +16,32 @@ async function main() {
 
   // Process discover-contract jobs
   queue.process('discover-contract', async (job) => {
-    console.log(`Processing discover-contract job for ${job.data.contractId}`);
+    const { queryOne } = await import('../db');
+    const contract = await queryOne<{ network_name: string; stablecoin_name: string }>(
+      `SELECT n.name as network_name, s.name as stablecoin_name
+       FROM contracts c
+       JOIN networks n ON c.network_id = n.id
+       JOIN stablecoins s ON c.stablecoin_id = s.id
+       WHERE c.id = $1`,
+      [job.data.contractId]
+    );
+    console.log(`Processing discover-contract job for ${contract?.stablecoin_name || 'unknown'} on ${contract?.network_name || 'unknown'}`);
     await discoverContract(job.data.contractId);
     return { success: true };
   });
 
   // Process sync-contract jobs
   queue.process('sync-contract', async (job) => {
-    console.log(`Processing sync-contract job for ${job.data.contractId}`);
+    const { queryOne } = await import('../db');
+    const contract = await queryOne<{ network_name: string; stablecoin_name: string }>(
+      `SELECT n.name as network_name, s.name as stablecoin_name
+       FROM contracts c
+       JOIN networks n ON c.network_id = n.id
+       JOIN stablecoins s ON c.stablecoin_id = s.id
+       WHERE c.id = $1`,
+      [job.data.contractId]
+    );
+    console.log(`Processing sync-contract job for ${contract?.stablecoin_name || 'unknown'} on ${contract?.network_name || 'unknown'}`);
     await syncContract(job.data.contractId);
     return { success: true };
   });
