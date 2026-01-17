@@ -1,6 +1,7 @@
 import { ethers, Contract, Provider, JsonRpcProvider } from 'ethers';
 import { BlockchainAdapter, registerAdapter } from './base';
 import { ChainType, TransferEvent, MintEvent, BurnEvent } from '../../types';
+import { isShutdownRequested } from '../worker';
 
 // Standard ERC20 ABI for Transfer events and basic functions
 const ERC20_ABI = [
@@ -15,6 +16,15 @@ const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 // Max block range for getLogs (varies by RPC provider)
 const MAX_BLOCK_RANGE = 10000;
+
+// Transaction receipt retry settings
+const MAX_RECEIPT_RETRIES = 5;
+const INITIAL_RETRY_DELAY_MS = 500;
+
+// Helper function to sleep
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 export class EVMAdapter implements BlockchainAdapter {
   readonly chainType: ChainType = 'evm';
@@ -62,11 +72,7 @@ export class EVMAdapter implements BlockchainAdapter {
 
   async getContractCreationBlock(address: string): Promise<number | null> {
     const provider = this.getProvider();
-
-    // Binary search for contract creation block
     const currentBlock = await provider.getBlockNumber();
-    let low = 0;
-    let high = currentBlock;
 
     // Check if contract exists now
     const code = await provider.getCode(address);
@@ -74,24 +80,74 @@ export class EVMAdapter implements BlockchainAdapter {
       return null; // No contract at this address
     }
 
-    // Binary search to find first block where contract exists
-    while (low < high) {
-      const mid = Math.floor((low + high) / 2);
-
-      try {
-        const codeAtMid = await provider.getCode(address, mid);
-        if (codeAtMid === '0x') {
-          low = mid + 1;
-        } else {
-          high = mid;
-        }
-      } catch {
-        // If we can't get code at this block, assume contract didn't exist
-        low = mid + 1;
-      }
+    // Try binary search with archive node (only works if RPC supports historical state)
+    let archiveNodeWorks = false;
+    try {
+      // Test if we can query historical state
+      const testBlock = Math.max(1, currentBlock - 1000);
+      await provider.getCode(address, testBlock);
+      archiveNodeWorks = true;
+    } catch {
+      console.log('  Archive node not available, will search for first Transfer event instead');
     }
 
-    return low;
+    if (archiveNodeWorks) {
+      // Binary search for contract creation block
+      let low = 0;
+      let high = currentBlock;
+
+      while (low < high) {
+        const mid = Math.floor((low + high) / 2);
+
+        try {
+          const codeAtMid = await provider.getCode(address, mid);
+          if (codeAtMid === '0x') {
+            low = mid + 1;
+          } else {
+            high = mid;
+          }
+        } catch {
+          // If we can't get code at this block, assume contract didn't exist
+          low = mid + 1;
+        }
+      }
+
+      return low;
+    } else {
+      // Fallback: Search for first Transfer event
+      // This is slower but works with regular full nodes
+      console.log('  Searching for first Transfer event (this may take a while)...');
+
+      const contract = new Contract(address, ERC20_ABI, provider);
+      const searchRange = 10000;
+
+      // Search in chunks from block 0
+      for (let start = 0; start < currentBlock; start += searchRange) {
+        // Check for shutdown request
+        if (isShutdownRequested()) {
+          console.log('  Shutdown requested, stopping creation block search');
+          return null;
+        }
+
+        const end = Math.min(start + searchRange - 1, currentBlock);
+
+        try {
+          const filter = contract.filters.Transfer();
+          const logs = await contract.queryFilter(filter, start, end);
+
+          if (logs.length > 0) {
+            // Found first transfer event
+            return logs[0].blockNumber;
+          }
+        } catch (error) {
+          // Some ranges might fail, continue searching
+          console.log(`  Error searching blocks ${start}-${end}, continuing...`);
+        }
+      }
+
+      // If we couldn't find any Transfer events, return null
+      return null;
+    }
   }
 
   async getTokenDecimals(address: string): Promise<number> {
@@ -120,6 +176,12 @@ export class EVMAdapter implements BlockchainAdapter {
 
     // Process in chunks to avoid RPC limits
     for (let start = fromBlock; start <= toBlock; start += MAX_BLOCK_RANGE) {
+      // Check for shutdown request
+      if (isShutdownRequested()) {
+        console.log('  Shutdown requested, stopping transfer event fetch');
+        break;
+      }
+
       const end = Math.min(start + MAX_BLOCK_RANGE - 1, toBlock);
 
       const filter = contract.filters.Transfer();
@@ -185,36 +247,85 @@ export class EVMAdapter implements BlockchainAdapter {
 
   async getTransactionFee(txHash: string): Promise<{ feeNative: string; feeUsd: string | null }> {
     const provider = this.getProvider();
-    const receipt = await provider.getTransactionReceipt(txHash);
 
-    if (!receipt) {
-      throw new Error(`Transaction ${txHash} not found`);
+    let lastError: Error | null = null;
+
+    // Retry with exponential backoff
+    for (let attempt = 0; attempt < MAX_RECEIPT_RETRIES; attempt++) {
+      // Check for shutdown request
+      if (isShutdownRequested()) {
+        throw new Error('Shutdown requested');
+      }
+
+      try {
+        const receipt = await provider.getTransactionReceipt(txHash);
+
+        if (!receipt) {
+          // Receipt not found, will retry
+          lastError = new Error(`Transaction ${txHash} not found`);
+
+          if (attempt < MAX_RECEIPT_RETRIES - 1) {
+            const delayMs = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
+            console.log(`  Transaction receipt not found for ${txHash}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_RECEIPT_RETRIES})...`);
+            await sleep(delayMs);
+            continue;
+          }
+
+          throw lastError;
+        }
+
+        const fee = receipt.gasUsed * receipt.gasPrice;
+        return {
+          feeNative: fee.toString(),
+          feeUsd: null, // Would need price oracle for USD conversion
+        };
+      } catch (error) {
+        lastError = error as Error;
+
+        // If it's a network error or timeout, retry
+        if (attempt < MAX_RECEIPT_RETRIES - 1) {
+          const delayMs = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
+          console.log(`  Error fetching transaction receipt for ${txHash}: ${lastError.message}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_RECEIPT_RETRIES})...`);
+          await sleep(delayMs);
+          continue;
+        }
+
+        throw lastError;
+      }
     }
 
-    const fee = receipt.gasUsed * receipt.gasPrice;
-    return {
-      feeNative: fee.toString(),
-      feeUsd: null, // Would need price oracle for USD conversion
-    };
+    throw lastError || new Error(`Transaction ${txHash} not found after ${MAX_RECEIPT_RETRIES} attempts`);
   }
 
   async getTransactionFees(txHashes: string[]): Promise<Map<string, { feeNative: string; feeUsd: string | null }>> {
     const results = new Map<string, { feeNative: string; feeUsd: string | null }>();
 
-    // Process in parallel batches
-    const batchSize = 10;
+    // Process in parallel batches (smaller batch to avoid overwhelming the RPC)
+    const batchSize = 5;
     for (let i = 0; i < txHashes.length; i += batchSize) {
+      // Check for shutdown request
+      if (isShutdownRequested()) {
+        console.log('  Shutdown requested, stopping transaction fee fetch');
+        break;
+      }
+
       const batch = txHashes.slice(i, i + batchSize);
       const promises = batch.map(async (txHash) => {
         try {
           const fee = await this.getTransactionFee(txHash);
           results.set(txHash, fee);
         } catch (error) {
-          console.warn(`Failed to get fee for ${txHash}:`, error);
+          console.error(`Failed to get fee for ${txHash} after ${MAX_RECEIPT_RETRIES} retries: ${(error as Error).message}`);
+          // Set fee to 0 if we can't get it after all retries
           results.set(txHash, { feeNative: '0', feeUsd: null });
         }
       });
       await Promise.all(promises);
+
+      // Small delay between batches to avoid overwhelming the RPC
+      if (i + batchSize < txHashes.length) {
+        await sleep(100);
+      }
     }
 
     return results;

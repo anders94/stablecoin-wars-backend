@@ -69,7 +69,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 // Create contract (triggers indexing)
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { stablecoin_id, network_id, contract_address, rpc_endpoint } = req.body as CreateContractRequest;
+    const { stablecoin_id, network_id, contract_address, rpc_endpoint, creation_block } = req.body as CreateContractRequest & { creation_block?: number };
 
     if (!stablecoin_id || !network_id || !contract_address || !rpc_endpoint) {
       return res.status(400).json({
@@ -78,20 +78,22 @@ router.post('/', async (req: Request, res: Response) => {
     }
 
     const result = await transaction(async (client) => {
-      // Create contract
+      // Create contract with optional creation_block
       const contractResult = await client.query(
-        `INSERT INTO contracts (stablecoin_id, network_id, contract_address, rpc_endpoint)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO contracts (stablecoin_id, network_id, contract_address, rpc_endpoint, creation_block)
+         VALUES ($1, $2, $3, $4, $5)
          RETURNING *`,
-        [stablecoin_id, network_id, contract_address, rpc_endpoint]
+        [stablecoin_id, network_id, contract_address, rpc_endpoint, creation_block || null]
       );
       const contract = contractResult.rows[0] as Contract;
 
       // Create initial sync state
+      // If creation_block is provided, set last_synced_block to creation_block - 1
+      const initialBlock = creation_block ? creation_block - 1 : 0;
       await client.query(
-        `INSERT INTO sync_state (contract_id, status)
-         VALUES ($1, 'pending')`,
-        [contract.id]
+        `INSERT INTO sync_state (contract_id, status, last_synced_block)
+         VALUES ($1, $2, $3)`,
+        [contract.id, creation_block ? 'syncing' : 'pending', initialBlock]
       );
 
       return contract;
@@ -100,12 +102,24 @@ router.post('/', async (req: Request, res: Response) => {
     // Queue the contract for indexing
     try {
       const queue = getIndexerQueue();
-      await queue.add('discover-contract', {
-        contractId: result.id,
-      }, {
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 5000 },
-      });
+
+      if (creation_block) {
+        // If creation_block was provided, skip discovery and go straight to syncing
+        await queue.add('sync-contract', {
+          contractId: result.id,
+        }, {
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5000 },
+        });
+      } else {
+        // Otherwise, discover the contract first
+        await queue.add('discover-contract', {
+          contractId: result.id,
+        }, {
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5000 },
+        });
+      }
     } catch (queueError) {
       console.warn('Failed to queue indexing job:', queueError);
       // Don't fail the request, the contract was created

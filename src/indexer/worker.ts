@@ -9,10 +9,21 @@ import { closePool } from '../db';
 // Import adapters to register them
 import './adapters';
 
+// Global shutdown flag
+let isShuttingDown = false;
+
+export function isShutdownRequested(): boolean {
+  return isShuttingDown;
+}
+
 async function main() {
   console.log('Starting Stablecoin Wars Indexer Worker...');
 
   const queue = getIndexerQueue();
+
+  // Ensure queue is not paused from previous shutdown
+  await queue.resume(true); // Resume both locally and globally
+  console.log('Queue resumed and ready to process jobs');
 
   // Process discover-contract jobs
   queue.process('discover-contract', async (job) => {
@@ -58,6 +69,10 @@ async function main() {
   });
 
   // Event handlers
+  queue.on('active', (job) => {
+    console.log(`Job ${job.id} (${job.name}) started processing`);
+  });
+
   queue.on('completed', (job, result) => {
     console.log(`Job ${job.id} (${job.name}) completed:`, result);
   });
@@ -70,10 +85,110 @@ async function main() {
     console.error('Queue error:', err);
   });
 
+  queue.on('stalled', (job) => {
+    console.warn(`Job ${job?.id} (${job?.name}) has stalled`);
+  });
+
+  // Initialize: discover and sync all contracts
+  async function initializeContracts() {
+    console.log('Initializing contracts...');
+
+    // Clean up any stuck or stalled jobs from previous runs
+    const activeJobs = await queue.getActive();
+    const waitingJobs = await queue.getWaiting();
+    const delayedJobs = await queue.getDelayed();
+
+    console.log(`Queue status: ${activeJobs.length} active, ${waitingJobs.length} waiting, ${delayedJobs.length} delayed`);
+
+    // Remove stuck active jobs (from crashed previous runs)
+    for (const job of activeJobs) {
+      console.log(`  Cleaning up stuck active job: ${job.id} (${job.name})`);
+      await job.moveToFailed({ message: 'Job stuck from previous run, cleaned up on restart' }, true);
+    }
+
+    const { query } = await import('../db');
+
+    // Find all pending contracts (never been synced)
+    const pendingContracts = await query<{ id: string; network_name: string; stablecoin_name: string }>(
+      `SELECT c.id, n.name as network_name, s.name as stablecoin_name
+       FROM contracts c
+       JOIN networks n ON c.network_id = n.id
+       JOIN stablecoins s ON c.stablecoin_id = s.id
+       JOIN sync_state ss ON c.id = ss.contract_id
+       WHERE c.is_active = true AND ss.status = 'pending'`
+    );
+
+    if (pendingContracts.length > 0) {
+      console.log(`Found ${pendingContracts.length} contracts to discover and sync`);
+      for (const contract of pendingContracts) {
+        console.log(`  Queueing discovery for ${contract.stablecoin_name} on ${contract.network_name}`);
+        const jobId = `discover-${contract.id}`;
+
+        // Remove existing job if it exists
+        const existingJob = await queue.getJob(jobId);
+        if (existingJob) {
+          console.log(`    Removing existing job ${jobId}`);
+          await existingJob.remove();
+        }
+
+        await queue.add('discover-contract', {
+          contractId: contract.id,
+        }, {
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5000 },
+          jobId,
+        });
+      }
+    }
+
+    // Find all contracts that need to catch up or retry
+    // This includes: synced (ready to catch up), syncing (stuck/retry), error (retry)
+    const activeContracts = await query<{ id: string; network_name: string; stablecoin_name: string; status: string }>(
+      `SELECT c.id, n.name as network_name, s.name as stablecoin_name, ss.status
+       FROM contracts c
+       JOIN networks n ON c.network_id = n.id
+       JOIN stablecoins s ON c.stablecoin_id = s.id
+       JOIN sync_state ss ON c.id = ss.contract_id
+       WHERE c.is_active = true AND ss.status IN ('synced', 'syncing', 'error')`
+    );
+
+    if (activeContracts.length > 0) {
+      console.log(`Found ${activeContracts.length} contracts to sync`);
+      for (const contract of activeContracts) {
+        console.log(`  Queueing sync for ${contract.stablecoin_name} on ${contract.network_name} (status: ${contract.status})`);
+        const jobId = `sync-${contract.id}`;
+
+        // Remove existing job if it exists
+        const existingJob = await queue.getJob(jobId);
+        if (existingJob) {
+          console.log(`    Removing existing job ${jobId}`);
+          await existingJob.remove();
+        }
+
+        await queue.add('sync-contract', {
+          contractId: contract.id,
+        }, {
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5000 },
+          jobId,
+        });
+      }
+    }
+
+    if (pendingContracts.length === 0 && activeContracts.length === 0) {
+      console.log('No contracts found to sync');
+    }
+
+    console.log('Initialization complete');
+  }
+
+  // Run initialization
+  await initializeContracts();
+
   // Schedule periodic aggregation
   const AGGREGATION_INTERVAL = 60 * 60 * 1000; // 1 hour
 
-  setInterval(async () => {
+  const aggregationInterval = setInterval(async () => {
     try {
       await queue.add('aggregate-metrics', {}, {
         attempts: 1,
@@ -84,25 +199,49 @@ async function main() {
     }
   }, AGGREGATION_INTERVAL);
 
-  // Schedule periodic sync for all contracts
-  const SYNC_INTERVAL = 5 * 60 * 1000; // 5 minutes
+  // Schedule continuous sync for all active contracts
+  // Check every 30 seconds to keep contracts up to date
+  const SYNC_INTERVAL = 30 * 1000; // 30 seconds
 
-  setInterval(async () => {
+  const syncInterval = setInterval(async () => {
     try {
       const { query } = await import('../db');
-      const contracts = await query<{ id: string }>(
-        `SELECT c.id FROM contracts c
+
+      // Sync all contracts that are ready to sync
+      // 'synced' = ready to catch up with new blocks
+      // 'error' = retry after error
+      // Note: We don't include 'syncing' here to avoid conflicts with already-running jobs
+      // Note: We don't include 'pending' here as those go through discover-contract first
+      const contracts = await query<{ id: string; network_name: string; stablecoin_name: string }>(
+        `SELECT c.id, n.name as network_name, s.name as stablecoin_name
+         FROM contracts c
+         JOIN networks n ON c.network_id = n.id
+         JOIN stablecoins s ON c.stablecoin_id = s.id
          JOIN sync_state ss ON c.id = ss.contract_id
-         WHERE c.is_active = true AND ss.status = 'synced'`
+         WHERE c.is_active = true AND ss.status IN ('synced', 'error')`
       );
 
       for (const contract of contracts) {
+        const jobId = `sync-${contract.id}`;
+
+        // Check if job already exists to avoid unnecessary operations
+        const existingJob = await queue.getJob(jobId);
+        if (existingJob) {
+          const state = await existingJob.getState();
+          // Only add if not already waiting or active
+          if (state === 'waiting' || state === 'active' || state === 'delayed') {
+            continue;
+          }
+          // Remove completed or failed jobs
+          await existingJob.remove();
+        }
+
         await queue.add('sync-contract', {
           contractId: contract.id,
         }, {
           attempts: 3,
           backoff: { type: 'exponential', delay: 5000 },
-          jobId: `sync-${contract.id}`, // Prevent duplicate jobs
+          jobId,
         });
       }
     } catch (error) {
@@ -114,11 +253,48 @@ async function main() {
 
   // Graceful shutdown
   const shutdown = async () => {
+    if (isShuttingDown) {
+      console.log('Shutdown already in progress...');
+      return;
+    }
+
     console.log('Shutting down indexer worker...');
-    await closeQueue();
-    await closePool();
-    console.log('Indexer worker stopped');
-    process.exit(0);
+    isShuttingDown = true;
+
+    // Set a timeout to force exit if graceful shutdown takes too long
+    const forceExitTimeout = setTimeout(() => {
+      console.error('Graceful shutdown timed out, forcing exit...');
+      process.exit(1);
+    }, 10000); // 10 seconds timeout
+
+    try {
+      // Stop scheduling new jobs
+      clearInterval(aggregationInterval);
+      clearInterval(syncInterval);
+      console.log('Stopped scheduling intervals');
+
+      // Pause the queue to prevent new job processing
+      await queue.pause(true, true); // pause locally and globally
+      console.log('Queue paused');
+
+      // Close queue connections
+      await closeQueue();
+      console.log('Queue closed');
+
+      // Close database pool
+      await closePool();
+      console.log('Database pool closed');
+
+      // Clear the force exit timeout since we succeeded
+      clearTimeout(forceExitTimeout);
+
+      console.log('Indexer worker stopped gracefully');
+      process.exit(0);
+    } catch (error) {
+      console.error('Error during shutdown:', error);
+      clearTimeout(forceExitTimeout);
+      process.exit(1);
+    }
   };
 
   process.on('SIGTERM', shutdown);

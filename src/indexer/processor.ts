@@ -2,6 +2,7 @@ import { PoolClient } from 'pg';
 import { createAdapter, BlockchainAdapter } from './adapters';
 import { transaction, queryOne, execute } from '../db';
 import { Contract, Network, SyncState, RESOLUTIONS, TransferEvent } from '../types';
+import { isShutdownRequested } from './worker';
 
 // Number of blocks to process per batch
 const BLOCKS_PER_BATCH = 1000;
@@ -62,13 +63,15 @@ export async function discoverContract(contractId: string): Promise<void> {
     let creationBlock = contract.creation_block;
 
     if (!creationBlock) {
-      console.log('Finding contract creation block...');
+      console.log(`Finding creation block for ${contract.stablecoin_name} on ${contract.network_name}...`);
       creationBlock = await adapter.getContractCreationBlock(contract.contract_address);
 
       if (creationBlock) {
         // Get timestamp for creation block
         const timestamp = await adapter.getBlockTimestamp(creationBlock);
         const creationDate = new Date(timestamp * 1000);
+
+        console.log(`  Found creation block: ${creationBlock.toLocaleString()} (${creationDate.toISOString()})`);
 
         // Update contract with creation info
         await execute(
@@ -77,9 +80,11 @@ export async function discoverContract(contractId: string): Promise<void> {
         );
       } else {
         // Use a fallback - try to get first Transfer event
-        console.log('Could not determine creation block, will start from beginning');
+        console.log('  Could not determine creation block, starting from block 1');
         creationBlock = 1;
       }
+    } else {
+      console.log(`  Using known creation block: ${creationBlock.toLocaleString()}`);
     }
 
     // Update sync state with starting block
@@ -147,14 +152,57 @@ export async function syncContract(contractId: string): Promise<void> {
     adapter = await createAdapter(contract.chain_type, contract.rpc_endpoint);
 
     const currentBlock = await adapter.getCurrentBlockNumber();
-    let fromBlock = syncState.last_synced_block + 1;
+    // Ensure last_synced_block is a number (PostgreSQL may return as string)
+    const lastSyncedBlock = Number(syncState.last_synced_block);
+    let fromBlock = lastSyncedBlock + 1;
 
-    console.log(`Syncing ${contract.stablecoin_name} on ${contract.network_name} from block ${fromBlock} to ${currentBlock}`);
+    const totalBlocks = currentBlock - fromBlock + 1;
+
+    console.log(`  Current block: ${currentBlock.toLocaleString()}`);
+    console.log(`  Last synced block: ${lastSyncedBlock.toLocaleString()}`);
+    console.log(`  Next block to sync: ${fromBlock.toLocaleString()}`);
+    console.log(`  Total blocks to process: ${totalBlocks.toLocaleString()}`);
+
+    if (totalBlocks <= 0) {
+      console.log(`${contract.stablecoin_name} on ${contract.network_name} is up to date (block ${currentBlock})`);
+
+      // Make sure status is set to 'synced' if it was in another state
+      if (syncState.status !== 'synced') {
+        await execute(
+          `UPDATE sync_state SET status = 'synced', updated_at = NOW() WHERE contract_id = $1`,
+          [contractId]
+        );
+      }
+
+      return;
+    }
+
+    console.log(`Syncing ${contract.stablecoin_name} on ${contract.network_name}: ${totalBlocks.toLocaleString()} blocks to process (${fromBlock} to ${currentBlock})`);
+
+    let processedBlocks = 0;
+    let totalTransfers = 0;
+    let totalMints = 0;
+    let totalBurns = 0;
 
     while (fromBlock <= currentBlock) {
-      const toBlock = Math.min(fromBlock + BLOCKS_PER_BATCH - 1, currentBlock);
+      // Check for shutdown request
+      if (isShutdownRequested()) {
+        console.log(`Shutdown requested, stopping sync for ${contract.stablecoin_name} on ${contract.network_name} at block ${fromBlock}`);
+        // Update sync state before exiting
+        await execute(
+          `UPDATE sync_state
+           SET last_synced_block = $1, last_synced_at = NOW(), updated_at = NOW()
+           WHERE contract_id = $2`,
+          [fromBlock - 1, contractId]
+        );
+        return;
+      }
 
-      console.log(`Processing blocks ${fromBlock} to ${toBlock}...`);
+      const toBlock = Math.min(fromBlock + BLOCKS_PER_BATCH - 1, currentBlock);
+      processedBlocks += (toBlock - fromBlock + 1);
+
+      const progress = ((processedBlocks / totalBlocks) * 100).toFixed(1);
+      console.log(`[${progress}%] Processing blocks ${fromBlock.toLocaleString()} to ${toBlock.toLocaleString()}...`);
 
       // Get all transfer events in this range
       const transfers = await adapter.getTransferEvents(
@@ -169,6 +217,14 @@ export async function syncContract(contractId: string): Promise<void> {
         fromBlock,
         toBlock
       );
+
+      totalTransfers += transfers.length;
+      totalMints += mints.length;
+      totalBurns += burns.length;
+
+      if (transfers.length > 0 || mints.length > 0 || burns.length > 0) {
+        console.log(`  Found ${transfers.length} transfers, ${mints.length} mints, ${burns.length} burns`);
+      }
 
       // Process into daily metrics
       await processEvents(contractId, transfers, mints, burns, contract.decimals, adapter);
@@ -207,6 +263,7 @@ export async function syncContract(contractId: string): Promise<void> {
     );
 
     console.log(`${contract.stablecoin_name} on ${contract.network_name} synced successfully`);
+    console.log(`  Processed ${processedBlocks.toLocaleString()} blocks, ${totalTransfers.toLocaleString()} transfers, ${totalMints.toLocaleString()} mints, ${totalBurns.toLocaleString()} burns`);
   } catch (error) {
     console.error(`Error syncing ${contract.stablecoin_name} on ${contract.network_name}:`, error);
     await execute(
