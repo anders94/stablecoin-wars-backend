@@ -47,17 +47,17 @@ router.get('/:id', async (req: Request, res: Response) => {
  */
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { url, max_requests_per_minute, description } = req.body as CreateRpcEndpointRequest;
+    const { url, max_requests_per_second, max_blocks_per_query, description } = req.body as CreateRpcEndpointRequest;
 
     if (!url) {
       return res.status(400).json({ error: 'URL is required' });
     }
 
     const result = await pool.query(`
-      INSERT INTO rpc_endpoints (url, max_requests_per_minute, description)
-      VALUES ($1, $2, $3)
+      INSERT INTO rpc_endpoints (url, max_requests_per_second, max_blocks_per_query, description)
+      VALUES ($1, $2, $3, $4)
       RETURNING *
-    `, [url, max_requests_per_minute || 600, description || null]);
+    `, [url, max_requests_per_second || 10, max_blocks_per_query || 2000, description || null]);
 
     res.status(201).json(result.rows[0]);
   } catch (error: any) {
@@ -76,15 +76,19 @@ router.post('/', async (req: Request, res: Response) => {
 router.patch('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { max_requests_per_minute, is_active, description } = req.body as UpdateRpcEndpointRequest;
+    const { max_requests_per_second, max_blocks_per_query, is_active, description } = req.body as UpdateRpcEndpointRequest;
 
     const updates: string[] = [];
     const values: any[] = [];
     let paramIndex = 1;
 
-    if (max_requests_per_minute !== undefined) {
-      updates.push(`max_requests_per_minute = $${paramIndex++}`);
-      values.push(max_requests_per_minute);
+    if (max_requests_per_second !== undefined) {
+      updates.push(`max_requests_per_second = $${paramIndex++}`);
+      values.push(max_requests_per_second);
+    }
+    if (max_blocks_per_query !== undefined) {
+      updates.push(`max_blocks_per_query = $${paramIndex++}`);
+      values.push(max_blocks_per_query);
     }
     if (is_active !== undefined) {
       updates.push(`is_active = $${paramIndex++}`);

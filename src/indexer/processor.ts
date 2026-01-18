@@ -5,9 +5,9 @@ import { Contract, Network, SyncState, RESOLUTIONS, TransferEvent } from '../typ
 import { isShutdownRequested } from './worker';
 import { RateLimitService } from './rateLimit';
 
-// Number of blocks to process per batch
-// Set to 500 to stay under most RPC providers' limits (typically 800-2000)
-const BLOCKS_PER_BATCH = 500;
+// Number of blocks to process per batch is now configured per RPC endpoint
+// via the max_blocks_per_query field in the rpc_endpoints table
+// Different RPC providers have different limits (e.g., QuickNode discover plan: 5 blocks, others: 2000+ blocks)
 
 // Seconds in a day (for daily metrics)
 const SECONDS_PER_DAY = 86400;
@@ -26,7 +26,8 @@ interface ContractWithNetwork extends Contract {
   stablecoin_name: string;
   rpc_endpoint_id: string;
   rpc_endpoint: string;
-  max_requests_per_minute: number;
+  max_requests_per_second: number;
+  max_blocks_per_query: number;
 }
 
 interface DailyMetrics {
@@ -46,7 +47,7 @@ export async function discoverContract(contractId: string): Promise<void> {
   // Get contract details
   const contract = await queryOne<ContractWithNetwork>(
     `SELECT c.*, n.chain_type, n.name as network_name, s.decimals, s.name as stablecoin_name,
-            re.id as rpc_endpoint_id, re.url as rpc_endpoint, re.max_requests_per_minute
+            re.id as rpc_endpoint_id, re.url as rpc_endpoint, re.max_requests_per_second, re.max_blocks_per_query
      FROM contracts c
      JOIN networks n ON c.network_id = n.id
      JOIN stablecoins s ON c.stablecoin_id = s.id
@@ -74,7 +75,7 @@ export async function discoverContract(contractId: string): Promise<void> {
     adapter = await createAdapter(contract.chain_type, contract.rpc_endpoint, {
       rateLimiter,
       endpointId: contract.rpc_endpoint_id,
-      maxRequestsPerMinute: contract.max_requests_per_minute,
+      maxRequestsPerSecond: contract.max_requests_per_second,
     });
 
     // Find contract creation block
@@ -135,7 +136,7 @@ export async function syncContract(contractId: string): Promise<void> {
   // Get contract details
   const contract = await queryOne<ContractWithNetwork>(
     `SELECT c.*, n.chain_type, n.name as network_name, s.decimals, s.name as stablecoin_name,
-            re.id as rpc_endpoint_id, re.url as rpc_endpoint, re.max_requests_per_minute
+            re.id as rpc_endpoint_id, re.url as rpc_endpoint, re.max_requests_per_second, re.max_blocks_per_query
      FROM contracts c
      JOIN networks n ON c.network_id = n.id
      JOIN stablecoins s ON c.stablecoin_id = s.id
@@ -173,7 +174,7 @@ export async function syncContract(contractId: string): Promise<void> {
     adapter = await createAdapter(contract.chain_type, contract.rpc_endpoint, {
       rateLimiter,
       endpointId: contract.rpc_endpoint_id,
-      maxRequestsPerMinute: contract.max_requests_per_minute,
+      maxRequestsPerSecond: contract.max_requests_per_second,
     });
 
     const currentBlock = await adapter.getCurrentBlockNumber();
@@ -223,11 +224,16 @@ export async function syncContract(contractId: string): Promise<void> {
         return;
       }
 
-      const toBlock = Math.min(fromBlock + BLOCKS_PER_BATCH - 1, currentBlock);
+      const toBlock = Math.min(fromBlock + contract.max_blocks_per_query - 1, currentBlock);
       processedBlocks += (toBlock - fromBlock + 1);
 
       const progress = ((processedBlocks / totalBlocks) * 100).toFixed(1);
-      console.log(`[${progress}%] Processing blocks ${fromBlock.toLocaleString()} to ${toBlock.toLocaleString()}...`);
+
+      // Get block timestamp to show progress in time
+      const blockTimestamp = await adapter.getBlockTimestamp(toBlock);
+      const blockDate = new Date(blockTimestamp * 1000).toISOString().split('T')[0]; // YYYY-MM-DD format
+
+      console.log(`[${progress}%] Processing blocks ${fromBlock.toLocaleString()} to ${toBlock.toLocaleString()} (${blockDate})...`);
 
       // Get all transfer events in this range
       const transfers = await adapter.getTransferEvents(

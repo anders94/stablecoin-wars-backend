@@ -11,7 +11,7 @@ interface TokenJob {
  *
  * Each RPC endpoint gets a dedicated Bull queue with configured rate limiter.
  * Before any RPC call, adapter acquires a "token" by adding a job to the endpoint's queue.
- * Bull's rate limiter enforces max requests per second.
+ * Bull's rate limiter enforces max requests per second (supports floating point rates).
  * If limit reached, job waits in queue (event-driven, no polling).
  * When rate limit allows, job processes immediately and RPC call executes.
  */
@@ -26,10 +26,10 @@ export class RateLimitService {
    * Waits (event-driven) if rate limit is exhausted.
    *
    * @param endpointId - Unique identifier for the RPC endpoint
-   * @param maxRequestsPerMinute - Maximum requests per minute allowed for this endpoint
+   * @param maxRequestsPerSecond - Maximum requests per second allowed for this endpoint (supports floats)
    */
-  async acquireToken(endpointId: string, maxRequestsPerMinute: number): Promise<void> {
-    const queue = this.getOrCreateQueue(endpointId, maxRequestsPerMinute);
+  async acquireToken(endpointId: string, maxRequestsPerSecond: number): Promise<void> {
+    const queue = this.getOrCreateQueue(endpointId, maxRequestsPerSecond);
 
     const job = await queue.add({
       endpointId,
@@ -44,11 +44,11 @@ export class RateLimitService {
    * Gets or creates a Bull queue for an endpoint.
    * Recreates queue if rate limit configuration changes.
    */
-  private getOrCreateQueue(endpointId: string, maxRequestsPerMinute: number): Queue.Queue<TokenJob> {
+  private getOrCreateQueue(endpointId: string, maxRequestsPerSecond: number): Queue.Queue<TokenJob> {
     let queue = this.queues.get(endpointId);
 
     // Create new queue if doesn't exist or config changed
-    if (!queue || this.endpointConfigs.get(endpointId) !== maxRequestsPerMinute) {
+    if (!queue || this.endpointConfigs.get(endpointId) !== maxRequestsPerSecond) {
       // Close old queue if exists
       if (queue) {
         queue.close().catch(err => console.error('Error closing old queue:', err));
@@ -58,8 +58,8 @@ export class RateLimitService {
       const newQueue = new Queue<TokenJob>(`rpc-rate-limit:${endpointId}`, {
         redis: this.redisOptions,
         limiter: {
-          max: maxRequestsPerMinute,  // Max requests
-          duration: 60000,             // Per 60 seconds (1 minute)
+          max: maxRequestsPerSecond,  // Max requests (supports floats)
+          duration: 1000,              // Per 1 second
         },
         defaultJobOptions: {
           removeOnComplete: true,  // Clean up immediately
@@ -91,7 +91,7 @@ export class RateLimitService {
       });
 
       this.queues.set(endpointId, newQueue);
-      this.endpointConfigs.set(endpointId, maxRequestsPerMinute);
+      this.endpointConfigs.set(endpointId, maxRequestsPerSecond);
 
       return newQueue;
     }

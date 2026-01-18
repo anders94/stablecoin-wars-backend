@@ -29,7 +29,8 @@ export interface Network {
 export interface RpcEndpoint {
   id: string;
   url: string;
-  max_requests_per_minute: number;
+  max_requests_per_second: number;
+  max_blocks_per_query: number;
   description: string | null;
   is_active: boolean;
   created_at: Date;
@@ -149,12 +150,14 @@ export interface CreateContractRequest {
 
 export interface CreateRpcEndpointRequest {
   url: string;
-  max_requests_per_minute?: number;
+  max_requests_per_second?: number;
+  max_blocks_per_query?: number;
   description?: string;
 }
 
 export interface UpdateRpcEndpointRequest {
-  max_requests_per_minute?: number;
+  max_requests_per_second?: number;
+  max_blocks_per_query?: number;
   is_active?: boolean;
   description?: string;
 }

@@ -54,13 +54,13 @@ export class RateLimitedAdapter implements BlockchainAdapter {
     private inner: BlockchainAdapter,
     private rateLimiter: RateLimitService,
     private endpointId: string,
-    private maxRequestsPerMinute: number
+    private maxRequestsPerSecond: number
   ) {
     this.chainType = inner.chainType;
   }
 
   async connect(rpcEndpoint: string): Promise<void> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.connect(rpcEndpoint);
   }
 
@@ -75,27 +75,27 @@ export class RateLimitedAdapter implements BlockchainAdapter {
   }
 
   async getCurrentBlockNumber(): Promise<number> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.getCurrentBlockNumber();
   }
 
   async getBlockTimestamp(blockNumber: number): Promise<number> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.getBlockTimestamp(blockNumber);
   }
 
   async getContractCreationBlock(address: string): Promise<number | null> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.getContractCreationBlock(address);
   }
 
   async getTokenDecimals(address: string): Promise<number> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.getTokenDecimals(address);
   }
 
   async getTotalSupply(address: string): Promise<string> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.getTotalSupply(address);
   }
 
@@ -104,7 +104,7 @@ export class RateLimitedAdapter implements BlockchainAdapter {
     fromBlock: number,
     toBlock: number
   ): Promise<TransferEvent[]> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.getTransferEvents(address, fromBlock, toBlock);
   }
 
@@ -113,7 +113,7 @@ export class RateLimitedAdapter implements BlockchainAdapter {
     fromBlock: number,
     toBlock: number
   ): Promise<{ mints: MintEvent[]; burns: BurnEvent[] }> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.getMintBurnEvents(address, fromBlock, toBlock);
   }
 
@@ -121,12 +121,12 @@ export class RateLimitedAdapter implements BlockchainAdapter {
     feeNative: string;
     feeUsd: string | null;
   }> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.getTransactionFee(txHash);
   }
 
   async getTransactionFees(txHashes: string[]): Promise<Map<string, { feeNative: string; feeUsd: string | null }>> {
-    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerMinute);
+    await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
     return this.inner.getTransactionFees(txHashes);
   }
 }
@@ -147,7 +147,7 @@ export async function createAdapter(
   rateLimitConfig?: {
     rateLimiter: RateLimitService;
     endpointId: string;
-    maxRequestsPerMinute: number;
+    maxRequestsPerSecond: number;
   }
 ): Promise<BlockchainAdapter> {
   const factory = adapterFactories.get(chainType);
@@ -163,7 +163,7 @@ export async function createAdapter(
       adapter,
       rateLimitConfig.rateLimiter,
       rateLimitConfig.endpointId,
-      rateLimitConfig.maxRequestsPerMinute
+      rateLimitConfig.maxRequestsPerSecond
     );
   }
 
