@@ -251,7 +251,7 @@ export async function syncContract(contractId: string): Promise<void> {
       console.log(`[${progress}%] Processing blocks ${fromBlock.toLocaleString()} to ${toBlock.toLocaleString()} (${blockDate})...`);
 
       // Get all transfer events in this range
-      const transfers = await adapter.getTransferEvents(
+      const allTransfers = await adapter.getTransferEvents(
         contract.contract_address,
         fromBlock,
         toBlock
@@ -262,6 +262,13 @@ export async function syncContract(contractId: string): Promise<void> {
         contract.contract_address,
         fromBlock,
         toBlock
+      );
+
+      // Filter out mints and burns from transfers to avoid double counting
+      // Mints are from 0x0, burns are to 0x0
+      const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+      const transfers = allTransfers.filter(t =>
+        t.from !== ZERO_ADDRESS && t.to !== ZERO_ADDRESS
       );
 
       totalTransfers += transfers.length;
