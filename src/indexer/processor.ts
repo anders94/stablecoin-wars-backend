@@ -43,6 +43,19 @@ interface DailyMetrics {
   endBlock: number;
 }
 
+interface BlockData {
+  blockNumber: number;
+  timestamp: number;
+  minted: bigint;
+  burned: bigint;
+  txCount: number;
+  senders: Set<string>;
+  receivers: Set<string>;
+  totalTransferred: bigint;
+  totalFeesNative: bigint;
+  totalSupply: string | null;
+}
+
 export async function discoverContract(contractId: string): Promise<void> {
   // Get contract details
   const contract = await queryOne<ContractWithNetwork>(
@@ -85,23 +98,25 @@ export async function discoverContract(contractId: string): Promise<void> {
       console.log(`Finding creation block for ${contract.stablecoin_name} on ${contract.network_name}...`);
       creationBlock = await adapter.getContractCreationBlock(contract.contract_address);
 
-      if (creationBlock) {
-        // Get timestamp for creation block
-        const timestamp = await adapter.getBlockTimestamp(creationBlock);
-        const creationDate = new Date(timestamp * 1000);
-
-        console.log(`  Found creation block: ${creationBlock.toLocaleString()} (${creationDate.toISOString()})`);
-
-        // Update contract with creation info
-        await execute(
-          `UPDATE contracts SET creation_block = $1, creation_date = $2 WHERE id = $3`,
-          [creationBlock, creationDate, contractId]
+      if (!creationBlock) {
+        throw new Error(
+          `Failed to find creation block for ${contract.stablecoin_name} on ${contract.network_name}. ` +
+          `Contract address: ${contract.contract_address}. ` +
+          `Please manually set the creation_block in the database or verify the contract address is correct.`
         );
-      } else {
-        // Use a fallback - try to get first Transfer event
-        console.log('  Could not determine creation block, starting from block 1');
-        creationBlock = 1;
       }
+
+      // Get timestamp for creation block
+      const timestamp = await adapter.getBlockTimestamp(creationBlock);
+      const creationDate = new Date(timestamp * 1000);
+
+      console.log(`  Found creation block: ${creationBlock.toLocaleString()} (${creationDate.toISOString()})`);
+
+      // Update contract with creation info
+      await execute(
+        `UPDATE contracts SET creation_block = $1, creation_date = $2 WHERE id = $3`,
+        [creationBlock, creationDate, contractId]
+      );
     } else {
       console.log(`  Using known creation block: ${creationBlock.toLocaleString()}`);
     }
@@ -259,6 +274,9 @@ export async function syncContract(contractId: string): Promise<void> {
 
       // Process into daily metrics
       await processEvents(contractId, transfers, mints, burns, contract.decimals, adapter);
+
+      // Process into block summaries (including blocks with no activity)
+      await processBlockSummaries(contractId, transfers, mints, burns, contract.decimals, adapter, fromBlock, toBlock);
 
       // Update sync state
       await execute(
@@ -425,5 +443,146 @@ async function processEvents(
         daily.endBlock,
       ]
     );
+  }
+}
+
+async function processBlockSummaries(
+  contractId: string,
+  transfers: TransferEvent[],
+  mints: { blockNumber: number; txHash: string; to: string; value: string; timestamp: number }[],
+  burns: { blockNumber: number; txHash: string; from: string; value: string; timestamp: number }[],
+  _decimals: number,
+  adapter: BlockchainAdapter,
+  fromBlock: number,
+  toBlock: number
+): Promise<void> {
+  // Create entries for ALL blocks in range, not just those with activity
+  const blocks = new Map<number, BlockData>();
+
+  // Initialize all blocks in range with zero values
+  // Timestamp will be null for blocks without events, and populated from events for blocks with activity
+  for (let blockNum = fromBlock; blockNum <= toBlock; blockNum++) {
+    blocks.set(blockNum, {
+      blockNumber: blockNum,
+      timestamp: 0, // Will be set from events, or left as 0 (converted to NULL in DB)
+      minted: BigInt(0),
+      burned: BigInt(0),
+      txCount: 0,
+      senders: new Set(),
+      receivers: new Set(),
+      totalTransferred: BigInt(0),
+      totalFeesNative: BigInt(0),
+      totalSupply: null,
+    });
+  }
+
+  const getOrCreateBlock = (blockNumber: number, timestamp: number): BlockData => {
+    const block = blocks.get(blockNumber)!;
+    // Set accurate timestamp from event
+    block.timestamp = timestamp;
+    return block;
+  };
+
+  // Process transfers
+  const txHashes = new Set<string>();
+  for (const transfer of transfers) {
+    const block = getOrCreateBlock(transfer.blockNumber, transfer.timestamp);
+    block.txCount++;
+    block.senders.add(transfer.from);
+    block.receivers.add(transfer.to);
+    block.totalTransferred += BigInt(transfer.value);
+    txHashes.add(transfer.txHash);
+  }
+
+  // Process mints
+  for (const mint of mints) {
+    const block = getOrCreateBlock(mint.blockNumber, mint.timestamp);
+    block.minted += BigInt(mint.value);
+    block.receivers.add(mint.to);
+  }
+
+  // Process burns
+  for (const burn of burns) {
+    const block = getOrCreateBlock(burn.blockNumber, burn.timestamp);
+    block.burned += BigInt(burn.value);
+    block.senders.add(burn.from);
+  }
+
+  // Get transaction fees (batch)
+  if (txHashes.size > 0) {
+    const fees = await adapter.getTransactionFees(Array.from(txHashes));
+
+    for (const transfer of transfers) {
+      const fee = fees.get(transfer.txHash);
+      if (fee) {
+        const block = getOrCreateBlock(transfer.blockNumber, transfer.timestamp);
+        block.totalFeesNative += BigInt(fee.feeNative);
+      }
+    }
+  }
+
+  // Upsert blocks to database
+  // Note: Blocks with events have accurate timestamps from the events
+  // Blocks without events use the approximate timestamp from the batch end block
+  for (const [_blockNumber, block] of blocks) {
+    // Insert or update block
+    const result = await queryOne<{ id: string }>(
+      `INSERT INTO blocks (
+        contract_id, block_number, timestamp,
+        minted, burned, tx_count, total_transferred, total_fees_native, total_supply
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      ON CONFLICT (contract_id, block_number)
+      DO UPDATE SET
+        minted = blocks.minted + EXCLUDED.minted,
+        burned = blocks.burned + EXCLUDED.burned,
+        tx_count = blocks.tx_count + EXCLUDED.tx_count,
+        total_transferred = blocks.total_transferred + EXCLUDED.total_transferred,
+        total_fees_native = blocks.total_fees_native + EXCLUDED.total_fees_native,
+        updated_at = NOW()
+      RETURNING id`,
+      [
+        contractId,
+        block.blockNumber,
+        block.timestamp > 0 ? new Date(block.timestamp * 1000) : null,
+        block.minted.toString(),
+        block.burned.toString(),
+        block.txCount,
+        block.totalTransferred.toString(),
+        block.totalFeesNative.toString(),
+        block.totalSupply,
+      ]
+    );
+
+    if (!result) {
+      continue;
+    }
+
+    const blockId = result.id;
+
+    // Insert unique addresses for this block
+    const allAddresses = new Map<string, 'sender' | 'receiver' | 'both'>();
+
+    for (const sender of block.senders) {
+      allAddresses.set(sender, 'sender');
+    }
+
+    for (const receiver of block.receivers) {
+      const existing = allAddresses.get(receiver);
+      if (existing === 'sender') {
+        allAddresses.set(receiver, 'both');
+      } else if (!existing) {
+        allAddresses.set(receiver, 'receiver');
+      }
+    }
+
+    // Batch insert addresses
+    for (const [address, addressType] of allAddresses) {
+      await execute(
+        `INSERT INTO block_addresses (contract_id, block_id, address, address_type)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (block_id, address) DO NOTHING`,
+        [contractId, blockId, address, addressType]
+      );
+    }
   }
 }

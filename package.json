@@ -9,7 +9,8 @@
     "migrate:up": "db-migrate up",
     "migrate:down": "db-migrate down",
     "migrate:create": "db-migrate create",
-    "indexer": "ts-node src/indexer/worker.ts"
+    "indexer": "ts-node src/indexer/worker.ts",
+    "fix-sync-state": "node scripts/fix-sync-state.js"
   },
   "keywords": ["stablecoin", "blockchain", "analytics"],
   "author": "",

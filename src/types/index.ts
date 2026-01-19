@@ -80,6 +80,30 @@ export interface Metrics {
   updated_at: Date;
 }
 
+export interface Block {
+  id: string;
+  contract_id: string;
+  block_number: number;
+  timestamp: Date;
+  minted: string;
+  burned: string;
+  tx_count: number;
+  total_transferred: string;
+  total_fees_native: string;
+  total_supply: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface BlockAddress {
+  id: string;
+  contract_id: string;
+  block_id: string;
+  address: string;
+  address_type: 'sender' | 'receiver' | 'both';
+  created_at: Date;
+}
+
 // Enums
 export type ChainType = 'evm' | 'tron' | 'solana';
 export type SyncStatus = 'pending' | 'syncing' | 'synced' | 'error';
