@@ -72,7 +72,7 @@ export interface Metrics {
   unique_senders: number;
   unique_receivers: number;
   total_transferred: string;
-  total_fees_native: string;
+  total_fees_native: string;  // Stored as wei (integer)
   total_fees_usd: string;
   start_block: number | null;
   end_block: number | null;
@@ -89,7 +89,7 @@ export interface Block {
   burned: string;
   tx_count: number;
   total_transferred: string;
-  total_fees_native: string;
+  total_fees_native: string;  // Stored as wei (integer)
   total_supply: string | null;
   created_at: Date;
   updated_at: Date;

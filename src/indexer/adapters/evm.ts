@@ -2,6 +2,8 @@ import { ethers, Contract, Provider, JsonRpcProvider } from 'ethers';
 import { BlockchainAdapter, registerAdapter } from './base';
 import { ChainType, TransferEvent, MintEvent, BurnEvent } from '../../types';
 import { isShutdownRequested } from '../worker';
+import { RateLimitService } from '../rateLimit';
+import { StatusLineReporter } from '../statusLineReporter';
 
 // Standard ERC20 ABI for Transfer events and basic functions
 const ERC20_ABI = [
@@ -31,12 +33,31 @@ export class EVMAdapter implements BlockchainAdapter {
 
   private provider: JsonRpcProvider | null = null;
   private rpcEndpoint: string = '';
+  private rateLimiter: RateLimitService | null = null;
+  private endpointId: string | null = null;
+  private maxRequestsPerSecond: number | null = null;
+
+  setRateLimiter(rateLimiter: RateLimitService, endpointId: string, maxRequestsPerSecond: number): void {
+    this.rateLimiter = rateLimiter;
+    this.endpointId = endpointId;
+    this.maxRequestsPerSecond = maxRequestsPerSecond;
+  }
+
+  private async acquireRateLimitToken(rpcCall?: string): Promise<void> {
+    if (this.rateLimiter && this.endpointId && this.maxRequestsPerSecond) {
+      if (rpcCall) {
+        StatusLineReporter.getInstance().trackRpcCall(rpcCall);
+      }
+      await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
+    }
+  }
 
   async connect(rpcEndpoint: string): Promise<void> {
     this.rpcEndpoint = rpcEndpoint;
     this.provider = new JsonRpcProvider(rpcEndpoint);
 
     // Test connection
+    await this.acquireRateLimitToken('eth_blockNumber (connect test)');
     await this.provider.getBlockNumber();
   }
 
@@ -59,10 +80,12 @@ export class EVMAdapter implements BlockchainAdapter {
   }
 
   async getCurrentBlockNumber(): Promise<number> {
+    await this.acquireRateLimitToken('eth_blockNumber');
     return this.getProvider().getBlockNumber();
   }
 
   async getBlockTimestamp(blockNumber: number): Promise<number> {
+    await this.acquireRateLimitToken(`eth_getBlockByNumber (${blockNumber})`);
     const block = await this.getProvider().getBlock(blockNumber);
     if (!block) {
       throw new Error(`Block ${blockNumber} not found`);
@@ -72,9 +95,11 @@ export class EVMAdapter implements BlockchainAdapter {
 
   async getContractCreationBlock(address: string): Promise<number | null> {
     const provider = this.getProvider();
+    await this.acquireRateLimitToken('eth_blockNumber');
     const currentBlock = await provider.getBlockNumber();
 
     // Check if contract exists now
+    await this.acquireRateLimitToken(`eth_getCode (${address})`);
     const code = await provider.getCode(address);
     if (code === '0x') {
       return null; // No contract at this address
@@ -85,6 +110,7 @@ export class EVMAdapter implements BlockchainAdapter {
     try {
       // Test if we can query historical state
       const testBlock = Math.max(1, currentBlock - 1000);
+      await this.acquireRateLimitToken(`eth_getCode (${address} @ ${testBlock})`);
       await provider.getCode(address, testBlock);
       archiveNodeWorks = true;
     } catch {
@@ -100,6 +126,7 @@ export class EVMAdapter implements BlockchainAdapter {
         const mid = Math.floor((low + high) / 2);
 
         try {
+          await this.acquireRateLimitToken(`eth_getCode (${address} @ ${mid})`);
           const codeAtMid = await provider.getCode(address, mid);
           if (codeAtMid === '0x') {
             low = mid + 1;
@@ -132,6 +159,7 @@ export class EVMAdapter implements BlockchainAdapter {
         const end = Math.min(start + searchRange - 1, currentBlock);
 
         try {
+          await this.acquireRateLimitToken(`eth_getLogs (Transfer ${start}-${end})`);
           const filter = contract.filters.Transfer();
           const logs = await contract.queryFilter(filter, start, end);
 
@@ -153,6 +181,7 @@ export class EVMAdapter implements BlockchainAdapter {
   async getTokenDecimals(address: string): Promise<number> {
     const contract = new Contract(address, ERC20_ABI, this.getProvider());
     try {
+      await this.acquireRateLimitToken(`eth_call (decimals ${address})`);
       return await contract.decimals();
     } catch {
       return 18; // Default to 18 decimals
@@ -161,6 +190,7 @@ export class EVMAdapter implements BlockchainAdapter {
 
   async getTotalSupply(address: string): Promise<string> {
     const contract = new Contract(address, ERC20_ABI, this.getProvider());
+    await this.acquireRateLimitToken(`eth_call (totalSupply ${address})`);
     const supply = await contract.totalSupply();
     return supply.toString();
   }
@@ -184,10 +214,12 @@ export class EVMAdapter implements BlockchainAdapter {
 
       const end = Math.min(start + MAX_BLOCK_RANGE - 1, toBlock);
 
+      await this.acquireRateLimitToken(`eth_getLogs (Transfer ${start}-${end})`);
       const filter = contract.filters.Transfer();
       const logs = await contract.queryFilter(filter, start, end);
 
       for (const log of logs) {
+        await this.acquireRateLimitToken(`eth_getBlockByHash (${log.blockHash.slice(0, 10)}...)`);
         const block = await log.getBlock();
         const parsed = contract.interface.parseLog({
           topics: log.topics as string[],
@@ -258,6 +290,7 @@ export class EVMAdapter implements BlockchainAdapter {
       }
 
       try {
+        await this.acquireRateLimitToken(`eth_getTransactionReceipt (${txHash.slice(0, 10)}...)`);
         const receipt = await provider.getTransactionReceipt(txHash);
 
         if (!receipt) {

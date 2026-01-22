@@ -5,6 +5,7 @@ import { getIndexerQueue, closeQueue } from './queue';
 import { discoverContract, syncContract } from './processor';
 import { aggregateMetrics, runFullAggregation } from './aggregator';
 import { closePool } from '../db';
+import { StatusLineReporter } from './statusLineReporter';
 
 // Import adapters to register them
 import './adapters';
@@ -17,13 +18,13 @@ export function isShutdownRequested(): boolean {
 }
 
 async function main() {
-  console.log('Starting Stablecoin Wars Indexer Worker...');
+  StatusLineReporter.getInstance().log('Starting Stablecoin Wars Indexer Worker...');
 
   const queue = getIndexerQueue();
 
   // Keep queue paused during initialization to prevent race conditions
   await queue.pause(true); // Pause both locally and globally
-  console.log('Queue paused for initialization');
+  StatusLineReporter.getInstance().log('Queue paused for initialization');
 
   // Process discover-contract jobs
   queue.process('discover-contract', async (job) => {
@@ -36,7 +37,7 @@ async function main() {
        WHERE c.id = $1`,
       [job.data.contractId]
     );
-    console.log(`Processing discover-contract job for ${contract?.stablecoin_name || 'unknown'} on ${contract?.network_name || 'unknown'}`);
+    StatusLineReporter.getInstance().log(`Processing discover-contract job for ${contract?.stablecoin_name || 'unknown'} on ${contract?.network_name || 'unknown'}`);
     await discoverContract(job.data.contractId);
     return { success: true };
   });
@@ -52,14 +53,14 @@ async function main() {
        WHERE c.id = $1`,
       [job.data.contractId]
     );
-    console.log(`Processing sync-contract job for ${contract?.stablecoin_name || 'unknown'} on ${contract?.network_name || 'unknown'}`);
+    StatusLineReporter.getInstance().log(`Processing sync-contract job for ${contract?.stablecoin_name || 'unknown'} on ${contract?.network_name || 'unknown'}`);
     await syncContract(job.data.contractId);
     return { success: true };
   });
 
   // Process aggregate-metrics jobs
   queue.process('aggregate-metrics', async (job) => {
-    console.log(`Processing aggregate-metrics job`);
+    StatusLineReporter.getInstance().log(`Processing aggregate-metrics job`);
     if (job.data.contractId) {
       await aggregateMetrics(job.data.contractId);
     } else {
@@ -70,11 +71,11 @@ async function main() {
 
   // Event handlers
   queue.on('active', (job) => {
-    console.log(`Job ${job.id} (${job.name}) started processing`);
+    StatusLineReporter.getInstance().log(`Job ${job.id} (${job.name}) started processing`);
   });
 
   queue.on('completed', (job, result) => {
-    console.log(`Job ${job.id} (${job.name}) completed:`, result);
+    StatusLineReporter.getInstance().log(`Job ${job.id} (${job.name}) completed: ${JSON.stringify(result)}`);
   });
 
   queue.on('failed', (job, err) => {
@@ -91,18 +92,18 @@ async function main() {
 
   // Initialize: discover and sync all contracts
   async function initializeContracts() {
-    console.log('Initializing contracts...');
+    StatusLineReporter.getInstance().log('Initializing contracts...');
 
     // Clean up any stuck or stalled jobs from previous runs
     const activeJobs = await queue.getActive();
     const waitingJobs = await queue.getWaiting();
     const delayedJobs = await queue.getDelayed();
 
-    console.log(`Queue status: ${activeJobs.length} active, ${waitingJobs.length} waiting, ${delayedJobs.length} delayed`);
+    StatusLineReporter.getInstance().log(`Queue status: ${activeJobs.length} active, ${waitingJobs.length} waiting, ${delayedJobs.length} delayed`);
 
     // Remove stuck active jobs (from crashed previous runs)
     for (const job of activeJobs) {
-      console.log(`  Cleaning up stuck active job: ${job.id} (${job.name})`);
+      StatusLineReporter.getInstance().log(`  Cleaning up stuck active job: ${job.id} (${job.name})`);
       await job.moveToFailed({ message: 'Job stuck from previous run, cleaned up on restart' }, true);
     }
 
@@ -119,9 +120,9 @@ async function main() {
     );
 
     if (pendingContracts.length > 0) {
-      console.log(`Found ${pendingContracts.length} contracts to discover and sync`);
+      StatusLineReporter.getInstance().log(`Found ${pendingContracts.length} contracts to discover and sync`);
       for (const contract of pendingContracts) {
-        console.log(`  Queueing discovery for ${contract.stablecoin_name} on ${contract.network_name}`);
+        StatusLineReporter.getInstance().log(`  Queueing discovery for ${contract.stablecoin_name} on ${contract.network_name}`);
         const jobId = `discover-${contract.id}`;
 
         // Check if job already exists
@@ -131,11 +132,11 @@ async function main() {
 
           // Remove failed or completed jobs so they can be retried
           if (state === 'failed' || state === 'completed') {
-            console.log(`    Cleaning up ${state} job ${jobId}`);
+            StatusLineReporter.getInstance().log(`    Cleaning up ${state} job ${jobId}`);
             await existingJob.remove();
           } else {
             // Skip active, waiting, or delayed jobs (let them continue)
-            console.log(`    Job ${jobId} already exists (state: ${state}), skipping`);
+            StatusLineReporter.getInstance().log(`    Job ${jobId} already exists (state: ${state}), skipping`);
             continue;
           }
         }
@@ -162,9 +163,9 @@ async function main() {
     );
 
     if (activeContracts.length > 0) {
-      console.log(`Found ${activeContracts.length} contracts to sync`);
+      StatusLineReporter.getInstance().log(`Found ${activeContracts.length} contracts to sync`);
       for (const contract of activeContracts) {
-        console.log(`  Queueing sync for ${contract.stablecoin_name} on ${contract.network_name} (status: ${contract.status})`);
+        StatusLineReporter.getInstance().log(`  Queueing sync for ${contract.stablecoin_name} on ${contract.network_name} (status: ${contract.status})`);
         const jobId = `sync-${contract.id}`;
 
         // Check if job already exists
@@ -174,11 +175,11 @@ async function main() {
 
           // Remove failed or completed jobs so they can be retried
           if (state === 'failed' || state === 'completed') {
-            console.log(`    Cleaning up ${state} job ${jobId}`);
+            StatusLineReporter.getInstance().log(`    Cleaning up ${state} job ${jobId}`);
             await existingJob.remove();
           } else {
             // Skip active, waiting, or delayed jobs (let them continue)
-            console.log(`    Job ${jobId} already exists (state: ${state}), skipping`);
+            StatusLineReporter.getInstance().log(`    Job ${jobId} already exists (state: ${state}), skipping`);
             continue;
           }
         }
@@ -194,10 +195,10 @@ async function main() {
     }
 
     if (pendingContracts.length === 0 && activeContracts.length === 0) {
-      console.log('No contracts found to sync');
+      StatusLineReporter.getInstance().log('No contracts found to sync');
     }
 
-    console.log('Initialization complete');
+    StatusLineReporter.getInstance().log('Initialization complete');
   }
 
   // Run initialization
@@ -206,6 +207,9 @@ async function main() {
   // Resume queue after initialization
   await queue.resume(true); // Resume both locally and globally
   console.log('Queue resumed and ready to process jobs');
+
+  // Start the status line reporter
+  StatusLineReporter.getInstance().start();
 
   // Schedule periodic aggregation
   const AGGREGATION_INTERVAL = 60 * 60 * 1000; // 1 hour
@@ -271,17 +275,20 @@ async function main() {
     }
   }, SYNC_INTERVAL);
 
-  console.log('Indexer worker is running. Waiting for jobs...');
+  StatusLineReporter.getInstance().log('Indexer worker is running. Waiting for jobs...');
 
   // Graceful shutdown
   const shutdown = async () => {
     if (isShuttingDown) {
-      console.log('Shutdown already in progress...');
+      StatusLineReporter.getInstance().log('Shutdown already in progress...');
       return;
     }
 
     console.log('Shutting down indexer worker...');
     isShuttingDown = true;
+
+    // Stop the status line reporter
+    StatusLineReporter.getInstance().stop();
 
     // Set a timeout to force exit if graceful shutdown takes too long
     const forceExitTimeout = setTimeout(() => {
@@ -293,24 +300,24 @@ async function main() {
       // Stop scheduling new jobs
       clearInterval(aggregationInterval);
       clearInterval(syncInterval);
-      console.log('Stopped scheduling intervals');
+      StatusLineReporter.getInstance().log('Stopped scheduling intervals');
 
       // Pause the queue to prevent new job processing
       await queue.pause(true, true); // pause locally and globally
-      console.log('Queue paused');
+      StatusLineReporter.getInstance().log('Queue paused');
 
       // Close queue connections
       await closeQueue();
-      console.log('Queue closed');
+      StatusLineReporter.getInstance().log('Queue closed');
 
       // Close database pool
       await closePool();
-      console.log('Database pool closed');
+      StatusLineReporter.getInstance().log('Database pool closed');
 
       // Clear the force exit timeout since we succeeded
       clearTimeout(forceExitTimeout);
 
-      console.log('Indexer worker stopped gracefully');
+      StatusLineReporter.getInstance().log('Indexer worker stopped gracefully');
       process.exit(0);
     } catch (error) {
       console.error('Error during shutdown:', error);

@@ -157,14 +157,17 @@ export async function createAdapter(
 
   const adapter = await factory(rpcEndpoint);
 
-  // Wrap with rate limiting if config provided
+  // Configure rate limiting if provided
   if (rateLimitConfig) {
-    return new RateLimitedAdapter(
-      adapter,
-      rateLimitConfig.rateLimiter,
-      rateLimitConfig.endpointId,
-      rateLimitConfig.maxRequestsPerSecond
-    );
+    // If adapter supports setRateLimiter, configure it directly
+    if ('setRateLimiter' in adapter && typeof adapter.setRateLimiter === 'function') {
+      (adapter as any).setRateLimiter(
+        rateLimitConfig.rateLimiter,
+        rateLimitConfig.endpointId,
+        rateLimitConfig.maxRequestsPerSecond
+      );
+    }
+    // Note: We no longer wrap with RateLimitedAdapter since the inner adapter handles it
   }
 
   return adapter;

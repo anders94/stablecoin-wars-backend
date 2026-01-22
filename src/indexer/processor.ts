@@ -4,6 +4,7 @@ import { transaction, queryOne, execute } from '../db';
 import { Contract, Network, SyncState, RESOLUTIONS, TransferEvent } from '../types';
 import { isShutdownRequested } from './worker';
 import { RateLimitService } from './rateLimit';
+import { StatusLineReporter } from './statusLineReporter';
 
 // Number of blocks to process per batch is now configured per RPC endpoint
 // via the max_blocks_per_query field in the rpc_endpoints table
@@ -73,7 +74,7 @@ export async function discoverContract(contractId: string): Promise<void> {
     throw new Error(`Contract ${contractId} not found`);
   }
 
-  console.log(`Discovering ${contract.stablecoin_name} on ${contract.network_name}...`);
+  StatusLineReporter.getInstance().log(`Discovering ${contract.stablecoin_name} on ${contract.network_name}...`);
 
   // Update sync state to syncing
   await execute(
@@ -95,7 +96,7 @@ export async function discoverContract(contractId: string): Promise<void> {
     let creationBlock = contract.creation_block;
 
     if (!creationBlock) {
-      console.log(`Finding creation block for ${contract.stablecoin_name} on ${contract.network_name}...`);
+      StatusLineReporter.getInstance().log(`Finding creation block for ${contract.stablecoin_name} on ${contract.network_name}...`);
       creationBlock = await adapter.getContractCreationBlock(contract.contract_address);
 
       if (!creationBlock) {
@@ -110,7 +111,7 @@ export async function discoverContract(contractId: string): Promise<void> {
       const timestamp = await adapter.getBlockTimestamp(creationBlock);
       const creationDate = new Date(timestamp * 1000);
 
-      console.log(`  Found creation block: ${creationBlock.toLocaleString()} (${creationDate.toISOString()})`);
+      StatusLineReporter.getInstance().log(`  Found creation block: ${creationBlock.toLocaleString()} (${creationDate.toISOString()})`);
 
       // Update contract with creation info
       await execute(
@@ -118,7 +119,7 @@ export async function discoverContract(contractId: string): Promise<void> {
         [creationBlock, creationDate, contractId]
       );
     } else {
-      console.log(`  Using known creation block: ${creationBlock.toLocaleString()}`);
+      StatusLineReporter.getInstance().log(`  Using known creation block: ${creationBlock.toLocaleString()}`);
     }
 
     // Update sync state with starting block
@@ -129,7 +130,7 @@ export async function discoverContract(contractId: string): Promise<void> {
       [creationBlock - 1, contractId]
     );
 
-    console.log(`${contract.stablecoin_name} on ${contract.network_name} discovered. Creation block: ${creationBlock}`);
+    StatusLineReporter.getInstance().log(`${contract.stablecoin_name} on ${contract.network_name} discovered. Creation block: ${creationBlock}`);
 
     // Start syncing
     await syncContract(contractId);
@@ -164,7 +165,7 @@ export async function syncContract(contractId: string): Promise<void> {
     throw new Error(`Contract ${contractId} not found`);
   }
 
-  console.log(`Syncing ${contract.stablecoin_name} on ${contract.network_name}...`);
+  StatusLineReporter.getInstance().log(`Syncing ${contract.stablecoin_name} on ${contract.network_name}...`);
 
   // Get current sync state
   const syncState = await queryOne<SyncState>(
@@ -199,13 +200,13 @@ export async function syncContract(contractId: string): Promise<void> {
 
     const totalBlocks = currentBlock - fromBlock + 1;
 
-    console.log(`  Current block: ${currentBlock.toLocaleString()}`);
-    console.log(`  Last synced block: ${lastSyncedBlock.toLocaleString()}`);
-    console.log(`  Next block to sync: ${fromBlock.toLocaleString()}`);
-    console.log(`  Total blocks to process: ${totalBlocks.toLocaleString()}`);
+    StatusLineReporter.getInstance().log(`  Current block: ${currentBlock.toLocaleString()}`);
+    StatusLineReporter.getInstance().log(`  Last synced block: ${lastSyncedBlock.toLocaleString()}`);
+    StatusLineReporter.getInstance().log(`  Next block to sync: ${fromBlock.toLocaleString()}`);
+    StatusLineReporter.getInstance().log(`  Total blocks to process: ${totalBlocks.toLocaleString()}`);
 
     if (totalBlocks <= 0) {
-      console.log(`${contract.stablecoin_name} on ${contract.network_name} is up to date (block ${currentBlock})`);
+      StatusLineReporter.getInstance().log(`${contract.stablecoin_name} on ${contract.network_name} is up to date (block ${currentBlock})`);
 
       // Make sure status is set to 'synced' if it was in another state
       if (syncState.status !== 'synced') {
@@ -218,7 +219,7 @@ export async function syncContract(contractId: string): Promise<void> {
       return;
     }
 
-    console.log(`Syncing ${contract.stablecoin_name} on ${contract.network_name}: ${totalBlocks.toLocaleString()} blocks to process (${fromBlock} to ${currentBlock})`);
+    StatusLineReporter.getInstance().log(`Syncing ${contract.stablecoin_name} on ${contract.network_name}: ${totalBlocks.toLocaleString()} blocks to process (${fromBlock} to ${currentBlock})`);
 
     let processedBlocks = 0;
     let totalTransfers = 0;
@@ -228,7 +229,7 @@ export async function syncContract(contractId: string): Promise<void> {
     while (fromBlock <= currentBlock) {
       // Check for shutdown request
       if (isShutdownRequested()) {
-        console.log(`Shutdown requested, stopping sync for ${contract.stablecoin_name} on ${contract.network_name} at block ${fromBlock}`);
+        StatusLineReporter.getInstance().log(`Shutdown requested, stopping sync for ${contract.stablecoin_name} on ${contract.network_name} at block ${fromBlock}`);
         // Update sync state before exiting
         await execute(
           `UPDATE sync_state
@@ -246,9 +247,9 @@ export async function syncContract(contractId: string): Promise<void> {
 
       // Get block timestamp to show progress in time
       const blockTimestamp = await adapter.getBlockTimestamp(toBlock);
-      const blockDate = new Date(blockTimestamp * 1000).toISOString().split('T')[0]; // YYYY-MM-DD format
+      const blockDateTime = new Date(blockTimestamp * 1000).toISOString().replace('T', ' ').substring(0, 16); // YYYY-MM-DD HH:MM format
 
-      console.log(`[${progress}%] Processing blocks ${fromBlock.toLocaleString()} to ${toBlock.toLocaleString()} (${blockDate})...`);
+      StatusLineReporter.getInstance().log(`[${progress}%] Processing blocks ${fromBlock.toLocaleString()} to ${toBlock.toLocaleString()} (${blockDateTime})...`);
 
       // Get all transfer events in this range
       const allTransfers = await adapter.getTransferEvents(
@@ -276,7 +277,7 @@ export async function syncContract(contractId: string): Promise<void> {
       totalBurns += burns.length;
 
       if (transfers.length > 0 || mints.length > 0 || burns.length > 0) {
-        console.log(`  Found ${transfers.length} transfers, ${mints.length} mints, ${burns.length} burns`);
+        StatusLineReporter.getInstance().log(`  Found ${transfers.length} transfers, ${mints.length} mints, ${burns.length} burns`);
       }
 
       // Process into daily metrics
@@ -318,8 +319,8 @@ export async function syncContract(contractId: string): Promise<void> {
       [contractId]
     );
 
-    console.log(`${contract.stablecoin_name} on ${contract.network_name} synced successfully`);
-    console.log(`  Processed ${processedBlocks.toLocaleString()} blocks, ${totalTransfers.toLocaleString()} transfers, ${totalMints.toLocaleString()} mints, ${totalBurns.toLocaleString()} burns`);
+    StatusLineReporter.getInstance().log(`${contract.stablecoin_name} on ${contract.network_name} synced successfully`);
+    StatusLineReporter.getInstance().log(`  Processed ${processedBlocks.toLocaleString()} blocks, ${totalTransfers.toLocaleString()} transfers, ${totalMints.toLocaleString()} mints, ${totalBurns.toLocaleString()} burns`);
   } catch (error) {
     console.error(`Error syncing ${contract.stablecoin_name} on ${contract.network_name}:`, error);
     await execute(
@@ -506,6 +507,8 @@ async function processBlockSummaries(
     const block = getOrCreateBlock(mint.blockNumber, mint.timestamp);
     block.minted += BigInt(mint.value);
     block.receivers.add(mint.to);
+    block.txCount++;
+    txHashes.add(mint.txHash);
   }
 
   // Process burns
@@ -513,16 +516,35 @@ async function processBlockSummaries(
     const block = getOrCreateBlock(burn.blockNumber, burn.timestamp);
     block.burned += BigInt(burn.value);
     block.senders.add(burn.from);
+    block.txCount++;
+    txHashes.add(burn.txHash);
   }
 
   // Get transaction fees (batch)
   if (txHashes.size > 0) {
     const fees = await adapter.getTransactionFees(Array.from(txHashes));
 
+    // Add fees for all transactions (transfers, mints, burns)
     for (const transfer of transfers) {
       const fee = fees.get(transfer.txHash);
       if (fee) {
         const block = getOrCreateBlock(transfer.blockNumber, transfer.timestamp);
+        block.totalFeesNative += BigInt(fee.feeNative);
+      }
+    }
+
+    for (const mint of mints) {
+      const fee = fees.get(mint.txHash);
+      if (fee) {
+        const block = getOrCreateBlock(mint.blockNumber, mint.timestamp);
+        block.totalFeesNative += BigInt(fee.feeNative);
+      }
+    }
+
+    for (const burn of burns) {
+      const fee = fees.get(burn.txHash);
+      if (fee) {
+        const block = getOrCreateBlock(burn.blockNumber, burn.timestamp);
         block.totalFeesNative += BigInt(fee.feeNative);
       }
     }

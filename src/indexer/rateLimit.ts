@@ -75,17 +75,6 @@ export class RateLimitService {
       });
 
       // Add event handlers for monitoring
-      newQueue.on('waiting', (jobId) => {
-        console.log(`Rate limit token waiting for ${endpointId}: ${jobId}`);
-      });
-
-      newQueue.on('completed', (job) => {
-        const waitTime = job.finishedOn ? job.finishedOn - (job.processedOn || job.finishedOn) : 0;
-        if (waitTime > 1000) {
-          console.log(`Token acquired for ${endpointId} after ${waitTime}ms wait`);
-        }
-      });
-
       newQueue.on('failed', (job, err) => {
         console.error(`Token acquisition failed for ${endpointId}:`, err.message);
       });

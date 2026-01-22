@@ -10,9 +10,14 @@
     "migrate:down": "db-migrate down",
     "migrate:create": "db-migrate create",
     "indexer": "ts-node src/indexer/worker.ts",
+    "backfill-fees": "ts-node src/indexer/backfill-fees.ts",
     "fix-sync-state": "node scripts/fix-sync-state.js"
   },
-  "keywords": ["stablecoin", "blockchain", "analytics"],
+  "keywords": [
+    "stablecoin",
+    "blockchain",
+    "analytics"
+  ],
   "author": "",
   "license": "ISC",
   "description": "Stablecoin analytics and comparison platform",
@@ -25,11 +30,13 @@
     "ethers": "^6.16.0",
     "express": "^5.2.1",
     "ioredis": "^5.9.2",
+    "log-update": "^7.0.2",
     "pg": "^8.17.1",
     "tronweb": "^6.1.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
+    "@types/log-update": "^2.0.0",
     "@types/node": "^25.0.9",
     "@types/pg": "^8.16.0",
     "nodemon": "^3.1.11",
