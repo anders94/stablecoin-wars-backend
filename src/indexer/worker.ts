@@ -22,6 +22,10 @@ async function main() {
 
   const queue = getIndexerQueue();
 
+  // Increase max listeners to handle multiple rate limit queues
+  // Each rate limiter queue adds listeners, and we may have many RPC endpoints
+  queue.setMaxListeners(50);
+
   // Keep queue paused during initialization to prevent race conditions
   await queue.pause(true); // Pause both locally and globally
   StatusLineReporter.getInstance().log('Queue paused for initialization');
@@ -132,8 +136,13 @@ async function main() {
 
           // Remove failed or completed jobs so they can be retried
           if (state === 'failed' || state === 'completed') {
-            StatusLineReporter.getInstance().log(`    Cleaning up ${state} job ${jobId}`);
-            await existingJob.remove();
+            try {
+              StatusLineReporter.getInstance().log(`    Cleaning up ${state} job ${jobId}`);
+              await existingJob.remove();
+            } catch (err) {
+              // Job might have been removed by another process or expired
+              StatusLineReporter.getInstance().log(`    Could not remove ${state} job ${jobId}, continuing anyway`);
+            }
           } else {
             // Skip active, waiting, or delayed jobs (let them continue)
             StatusLineReporter.getInstance().log(`    Job ${jobId} already exists (state: ${state}), skipping`);
@@ -146,6 +155,7 @@ async function main() {
         }, {
           attempts: 3,
           backoff: { type: 'exponential', delay: 5000 },
+          timeout: 7200000, // 2 hours for discovery
           jobId,
         });
       }
@@ -175,8 +185,13 @@ async function main() {
 
           // Remove failed or completed jobs so they can be retried
           if (state === 'failed' || state === 'completed') {
-            StatusLineReporter.getInstance().log(`    Cleaning up ${state} job ${jobId}`);
-            await existingJob.remove();
+            try {
+              StatusLineReporter.getInstance().log(`    Cleaning up ${state} job ${jobId}`);
+              await existingJob.remove();
+            } catch (err) {
+              // Job might have been removed by another process or expired
+              StatusLineReporter.getInstance().log(`    Could not remove ${state} job ${jobId}, continuing anyway`);
+            }
           } else {
             // Skip active, waiting, or delayed jobs (let them continue)
             StatusLineReporter.getInstance().log(`    Job ${jobId} already exists (state: ${state}), skipping`);
@@ -189,6 +204,7 @@ async function main() {
         }, {
           attempts: 3,
           backoff: { type: 'exponential', delay: 5000 },
+          timeout: 86400000, // 24 hour timeout for sync (large contracts need time)
           jobId,
         });
       }
@@ -231,7 +247,58 @@ async function main() {
 
   const syncInterval = setInterval(async () => {
     try {
-      const { query } = await import('../db');
+      const { query, execute } = await import('../db');
+
+      // First, detect and recover stuck contracts
+      // A contract is stuck if it's in 'syncing' status for more than 2 hours without progress
+      // (Jobs can run up to 24 hours, but should update status more frequently)
+      const stuckContracts = await query<{ id: string; network_name: string; stablecoin_name: string; updated_at: Date }>(
+        `SELECT c.id, n.name as network_name, s.name as stablecoin_name, ss.updated_at
+         FROM contracts c
+         JOIN networks n ON c.network_id = n.id
+         JOIN stablecoins s ON c.stablecoin_id = s.id
+         JOIN sync_state ss ON c.id = ss.contract_id
+         WHERE c.is_active = true
+           AND ss.status = 'syncing'
+           AND ss.updated_at < NOW() - INTERVAL '2 hours'`
+      );
+
+      for (const contract of stuckContracts) {
+        const jobId = `sync-${contract.id}`;
+        const job = await queue.getJob(jobId);
+
+        // If no job exists or job is not active, this contract is stuck
+        if (!job) {
+          StatusLineReporter.getInstance().log(`Detected stuck contract: ${contract.stablecoin_name} on ${contract.network_name} (no job found)`);
+          await execute(
+            `UPDATE sync_state
+             SET status = 'error',
+                 error_message = 'Recovered from stuck syncing state (no active job)',
+                 updated_at = NOW()
+             WHERE contract_id = $1`,
+            [contract.id]
+          );
+        } else {
+          const state = await job.getState();
+          if (state !== 'active' && state !== 'waiting' && state !== 'delayed') {
+            StatusLineReporter.getInstance().log(`Detected stuck contract: ${contract.stablecoin_name} on ${contract.network_name} (job state: ${state})`);
+            await execute(
+              `UPDATE sync_state
+               SET status = 'error',
+                   error_message = 'Recovered from stuck syncing state (job in ${state} state)',
+                   updated_at = NOW()
+               WHERE contract_id = $1`,
+              [contract.id]
+            );
+            try {
+              await job.remove();
+            } catch (err) {
+              // Job might have been removed already, that's fine
+              console.error(`Could not remove stuck job for ${contract.stablecoin_name}:`, (err as Error).message);
+            }
+          }
+        }
+      }
 
       // Sync all contracts that are ready to sync
       // 'synced' = ready to catch up with new blocks
@@ -259,7 +326,12 @@ async function main() {
             continue;
           }
           // Remove completed or failed jobs
-          await existingJob.remove();
+          try {
+            await existingJob.remove();
+          } catch (err) {
+            // Job might have been removed already, that's fine
+            console.error(`Could not remove ${state} job ${jobId}:`, (err as Error).message);
+          }
         }
 
         await queue.add('sync-contract', {
@@ -267,6 +339,7 @@ async function main() {
         }, {
           attempts: 3,
           backoff: { type: 'exponential', delay: 5000 },
+          timeout: 86400000, // 24 hour timeout for sync (large contracts need time)
           jobId,
         });
       }

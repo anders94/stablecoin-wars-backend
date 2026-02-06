@@ -12,11 +12,21 @@ const pool = new Pool({
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
+  // Add statement timeout to prevent hanging queries (30 minutes default)
+  statement_timeout: parseInt(process.env.DB_STATEMENT_TIMEOUT || '1800000'),
+  // Keep connections alive
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
 });
 
 pool.on('error', (err) => {
-  console.error('Unexpected error on idle client', err);
-  process.exit(-1);
+  // Log the error but don't exit - let the pool recover automatically
+  console.error('Database pool error (will attempt to recover):', err.message);
+  // Only exit on critical errors that prevent all operations
+  if (err.message && err.message.includes('terminating connection due to administrator command')) {
+    console.error('Database server is shutting down, exiting...');
+    process.exit(-1);
+  }
 });
 
 export async function query<T>(text: string, params?: unknown[]): Promise<T[]> {

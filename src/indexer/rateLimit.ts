@@ -1,5 +1,5 @@
 import Queue, { Job } from 'bull';
-import { RedisOptions } from 'ioredis';
+import Redis, { RedisOptions } from 'ioredis';
 
 interface TokenJob {
   endpointId: string;
@@ -55,8 +55,45 @@ export class RateLimitService {
       }
 
       // Create new queue with rate limiter
+      const baseRedisOptions = {
+        ...this.redisOptions,
+        // Add connection recovery settings
+        retryStrategy: (times: number) => {
+          // Exponential backoff with max 30 seconds
+          const delay = Math.min(times * 50, 30000);
+          console.log(`Rate limiter ${endpointId} Redis retry attempt ${times}, waiting ${delay}ms`);
+          return delay;
+        },
+        enableOfflineQueue: true,
+        connectTimeout: 10000,
+        keepAlive: 30000,
+      };
+
       const newQueue = new Queue<TokenJob>(`rpc-rate-limit:${endpointId}`, {
-        redis: this.redisOptions,
+        createClient: (type) => {
+          // bclient and subscriber must not have enableReadyCheck or maxRetriesPerRequest set
+          // See: https://github.com/OptimalBits/bull/issues/1873
+          const clientOptions = type === 'client'
+            ? { ...baseRedisOptions, maxRetriesPerRequest: null, enableReadyCheck: true }
+            : { ...baseRedisOptions, maxRetriesPerRequest: null, enableReadyCheck: false };
+
+          const client = new Redis(clientOptions);
+
+          // Add connection event handlers
+          client.on('error', (err: Error) => {
+            console.error(`Rate limiter ${endpointId} Redis ${type} error:`, err.message);
+          });
+
+          client.on('reconnecting', () => {
+            console.log(`Rate limiter ${endpointId} Redis ${type} reconnecting...`);
+          });
+
+          client.on('ready', () => {
+            console.log(`Rate limiter ${endpointId} Redis ${type} ready`);
+          });
+
+          return client;
+        },
         limiter: {
           max: maxRequestsPerSecond,  // Max requests (supports floats)
           duration: 1000,              // Per 1 second
@@ -65,6 +102,7 @@ export class RateLimitService {
           removeOnComplete: true,  // Clean up immediately
           removeOnFail: true,
           attempts: 1,             // Token acquisition doesn't retry
+          timeout: 300000,         // 5 minute timeout for token acquisition
         },
       });
 
@@ -77,6 +115,10 @@ export class RateLimitService {
       // Add event handlers for monitoring
       newQueue.on('failed', (job, err) => {
         console.error(`Token acquisition failed for ${endpointId}:`, err.message);
+      });
+
+      newQueue.on('error', (err) => {
+        console.error(`Rate limiter queue error for ${endpointId}:`, err.message);
       });
 
       this.queues.set(endpointId, newQueue);
