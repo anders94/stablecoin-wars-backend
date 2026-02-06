@@ -36,8 +36,16 @@ export class RateLimitService {
       requestId: `${Date.now()}-${Math.random()}`,
     });
 
-    // Wait for job to be processed (blocks async if rate limited)
-    await job.finished();
+    // Wait for job to be processed with timeout protection
+    // If Bull queue has issues, this prevents infinite hangs
+    const finishPromise = job.finished();
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`Rate limiter token acquisition timed out after 120s for endpoint ${endpointId}`));
+      }, 120000); // 2 minute timeout
+    });
+
+    await Promise.race([finishPromise, timeoutPromise]);
   }
 
   /**

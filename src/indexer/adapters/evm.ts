@@ -28,6 +28,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Helper function to add timeout to promises
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operationName: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${operationName} timed out after ${timeoutMs}ms`)), timeoutMs)
+    )
+  ]);
+}
+
+// RPC call timeout - 60 seconds for most calls
+const RPC_TIMEOUT_MS = 60000;
+
 export class EVMAdapter implements BlockchainAdapter {
   readonly chainType: ChainType = 'evm';
 
@@ -54,11 +67,18 @@ export class EVMAdapter implements BlockchainAdapter {
 
   async connect(rpcEndpoint: string): Promise<void> {
     this.rpcEndpoint = rpcEndpoint;
-    this.provider = new JsonRpcProvider(rpcEndpoint);
+    this.provider = new JsonRpcProvider(rpcEndpoint, undefined, {
+      staticNetwork: true, // Skip automatic network detection
+      batchMaxCount: 1,    // Disable request batching
+    });
 
-    // Test connection
+    // Test connection with timeout
     await this.acquireRateLimitToken('eth_blockNumber (connect test)');
-    await this.provider.getBlockNumber();
+    await withTimeout(
+      this.provider.getBlockNumber(),
+      RPC_TIMEOUT_MS,
+      'Connection test'
+    );
   }
 
   async disconnect(): Promise<void> {
@@ -81,12 +101,20 @@ export class EVMAdapter implements BlockchainAdapter {
 
   async getCurrentBlockNumber(): Promise<number> {
     await this.acquireRateLimitToken('eth_blockNumber');
-    return this.getProvider().getBlockNumber();
+    return withTimeout(
+      this.getProvider().getBlockNumber(),
+      RPC_TIMEOUT_MS,
+      'getCurrentBlockNumber'
+    );
   }
 
   async getBlockTimestamp(blockNumber: number): Promise<number> {
     await this.acquireRateLimitToken(`eth_getBlockByNumber (${blockNumber})`);
-    const block = await this.getProvider().getBlock(blockNumber);
+    const block = await withTimeout(
+      this.getProvider().getBlock(blockNumber),
+      RPC_TIMEOUT_MS,
+      `getBlockTimestamp(${blockNumber})`
+    );
     if (!block) {
       throw new Error(`Block ${blockNumber} not found`);
     }
@@ -96,11 +124,19 @@ export class EVMAdapter implements BlockchainAdapter {
   async getContractCreationBlock(address: string): Promise<number | null> {
     const provider = this.getProvider();
     await this.acquireRateLimitToken('eth_blockNumber');
-    const currentBlock = await provider.getBlockNumber();
+    const currentBlock = await withTimeout(
+      provider.getBlockNumber(),
+      RPC_TIMEOUT_MS,
+      'getContractCreationBlock - getCurrentBlock'
+    );
 
     // Check if contract exists now
     await this.acquireRateLimitToken(`eth_getCode (${address})`);
-    const code = await provider.getCode(address);
+    const code = await withTimeout(
+      provider.getCode(address),
+      RPC_TIMEOUT_MS,
+      `getCode ${address}`
+    );
     if (code === '0x') {
       return null; // No contract at this address
     }
@@ -111,7 +147,11 @@ export class EVMAdapter implements BlockchainAdapter {
       // Test if we can query historical state
       const testBlock = Math.max(1, currentBlock - 1000);
       await this.acquireRateLimitToken(`eth_getCode (${address} @ ${testBlock})`);
-      await provider.getCode(address, testBlock);
+      await withTimeout(
+        provider.getCode(address, testBlock),
+        RPC_TIMEOUT_MS,
+        `getCode ${address} @ ${testBlock}`
+      );
       archiveNodeWorks = true;
     } catch {
       console.log('  Archive node not available, will search for first Transfer event instead');
@@ -127,7 +167,11 @@ export class EVMAdapter implements BlockchainAdapter {
 
         try {
           await this.acquireRateLimitToken(`eth_getCode (${address} @ ${mid})`);
-          const codeAtMid = await provider.getCode(address, mid);
+          const codeAtMid = await withTimeout(
+            provider.getCode(address, mid),
+            RPC_TIMEOUT_MS,
+            `getCode ${address} @ ${mid}`
+          );
           if (codeAtMid === '0x') {
             low = mid + 1;
           } else {
@@ -161,7 +205,11 @@ export class EVMAdapter implements BlockchainAdapter {
         try {
           await this.acquireRateLimitToken(`eth_getLogs (Transfer ${start}-${end})`);
           const filter = contract.filters.Transfer();
-          const logs = await contract.queryFilter(filter, start, end);
+          const logs = await withTimeout(
+            contract.queryFilter(filter, start, end),
+            RPC_TIMEOUT_MS,
+            `queryFilter Transfer ${start}-${end}`
+          );
 
           if (logs.length > 0) {
             // Found first transfer event
@@ -182,7 +230,11 @@ export class EVMAdapter implements BlockchainAdapter {
     const contract = new Contract(address, ERC20_ABI, this.getProvider());
     try {
       await this.acquireRateLimitToken(`eth_call (decimals ${address})`);
-      return await contract.decimals();
+      return await withTimeout(
+        contract.decimals(),
+        RPC_TIMEOUT_MS,
+        `getTokenDecimals ${address}`
+      );
     } catch {
       return 18; // Default to 18 decimals
     }
@@ -191,7 +243,11 @@ export class EVMAdapter implements BlockchainAdapter {
   async getTotalSupply(address: string): Promise<string> {
     const contract = new Contract(address, ERC20_ABI, this.getProvider());
     await this.acquireRateLimitToken(`eth_call (totalSupply ${address})`);
-    const supply = await contract.totalSupply();
+    const supply = await withTimeout(
+      contract.totalSupply(),
+      RPC_TIMEOUT_MS,
+      `getTotalSupply ${address}`
+    );
     return supply.toString();
   }
 
@@ -216,11 +272,19 @@ export class EVMAdapter implements BlockchainAdapter {
 
       await this.acquireRateLimitToken(`eth_getLogs (Transfer ${start}-${end})`);
       const filter = contract.filters.Transfer();
-      const logs = await contract.queryFilter(filter, start, end);
+      const logs = await withTimeout(
+        contract.queryFilter(filter, start, end),
+        RPC_TIMEOUT_MS,
+        `queryFilter Transfer ${start}-${end}`
+      );
 
       for (const log of logs) {
         await this.acquireRateLimitToken(`eth_getBlockByHash (${log.blockHash.slice(0, 10)}...)`);
-        const block = await log.getBlock();
+        const block = await withTimeout(
+          log.getBlock(),
+          RPC_TIMEOUT_MS,
+          `getBlock for tx ${log.transactionHash}`
+        );
         const parsed = contract.interface.parseLog({
           topics: log.topics as string[],
           data: log.data,
@@ -291,7 +355,11 @@ export class EVMAdapter implements BlockchainAdapter {
 
       try {
         await this.acquireRateLimitToken(`eth_getTransactionReceipt (${txHash.slice(0, 10)}...)`);
-        const receipt = await provider.getTransactionReceipt(txHash);
+        const receipt = await withTimeout(
+          provider.getTransactionReceipt(txHash),
+          RPC_TIMEOUT_MS,
+          `getTransactionReceipt ${txHash}`
+        );
 
         if (!receipt) {
           // Receipt not found, will retry
@@ -345,15 +413,35 @@ export class EVMAdapter implements BlockchainAdapter {
       const batch = txHashes.slice(i, i + batchSize);
       const promises = batch.map(async (txHash) => {
         try {
+          // No outer timeout - let the retry logic in getTransactionFee handle it
+          // Each of 5 attempts has 60s timeout, so max ~5 minutes with retries
           const fee = await this.getTransactionFee(txHash);
           results.set(txHash, fee);
         } catch (error) {
-          console.error(`Failed to get fee for ${txHash} after ${MAX_RECEIPT_RETRIES} retries: ${(error as Error).message}`);
+          console.error(`Failed to get fee for ${txHash}: ${(error as Error).message}`);
           // Set fee to 0 if we can't get it after all retries
           results.set(txHash, { feeNative: '0', feeUsd: null });
         }
       });
-      await Promise.all(promises);
+
+      // Add timeout to Promise.all to prevent batch from hanging indefinitely
+      // Allow enough time for all retries: 5 attempts × 60s + delays ≈ 5 minutes per tx
+      // Since they run in parallel, batch timeout = slowest transaction time + buffer
+      try {
+        await withTimeout(
+          Promise.all(promises),
+          RPC_TIMEOUT_MS * 10, // 10 minutes for entire batch (allows full retry cycles)
+          `getTransactionFees batch ${i}-${i + batch.length}`
+        );
+      } catch (error) {
+        console.error(`Batch ${i}-${i + batch.length} timed out: ${(error as Error).message}`);
+        // Fill in remaining txs with zero fees
+        for (const txHash of batch) {
+          if (!results.has(txHash)) {
+            results.set(txHash, { feeNative: '0', feeUsd: null });
+          }
+        }
+      }
 
       // Small delay between batches to avoid overwhelming the RPC
       if (i + batchSize < txHashes.length) {

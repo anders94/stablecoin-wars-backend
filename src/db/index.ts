@@ -11,9 +11,9 @@ const pool = new Pool({
   database: process.env.DB_NAME || 'stablecoin_wars',
   max: 20,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-  // Add statement timeout to prevent hanging queries (30 minutes default)
-  statement_timeout: parseInt(process.env.DB_STATEMENT_TIMEOUT || '1800000'),
+  connectionTimeoutMillis: 5000,
+  // Add statement timeout to prevent hanging queries (2 minutes default, much faster failure detection)
+  statement_timeout: parseInt(process.env.DB_STATEMENT_TIMEOUT || '120000'),
   // Keep connections alive
   keepAlive: true,
   keepAliveInitialDelayMillis: 10000,

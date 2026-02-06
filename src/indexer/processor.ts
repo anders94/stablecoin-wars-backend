@@ -281,10 +281,13 @@ export async function syncContract(contractId: string): Promise<void> {
       }
 
       // Process into daily metrics
+      StatusLineReporter.getInstance().log(`  Processing events into daily metrics...`);
       await processEvents(contractId, transfers, mints, burns, contract.decimals, adapter);
 
       // Process into block summaries (including blocks with no activity)
+      StatusLineReporter.getInstance().log(`  Processing block summaries...`);
       await processBlockSummaries(contractId, transfers, mints, burns, contract.decimals, adapter, fromBlock, toBlock);
+      StatusLineReporter.getInstance().log(`  Completed processing batch`);
 
       // Update sync state
       await execute(
@@ -522,7 +525,9 @@ async function processBlockSummaries(
 
   // Get transaction fees (batch)
   if (txHashes.size > 0) {
+    StatusLineReporter.getInstance().log(`    Getting fees for ${txHashes.size} transactions...`);
     const fees = await adapter.getTransactionFees(Array.from(txHashes));
+    StatusLineReporter.getInstance().log(`    Retrieved fees, now writing blocks to database...`);
 
     // Add fees for all transactions (transfers, mints, burns)
     for (const transfer of transfers) {
@@ -553,7 +558,13 @@ async function processBlockSummaries(
   // Upsert blocks to database
   // Note: Blocks with events have accurate timestamps from the events
   // Blocks without events use the approximate timestamp from the batch end block
+  let blockIndex = 0;
+  const totalBlocks = blocks.size;
   for (const [_blockNumber, block] of blocks) {
+    blockIndex++;
+    if (blockIndex % 50 === 0) {
+      StatusLineReporter.getInstance().log(`      Writing block ${blockIndex}/${totalBlocks} to database...`);
+    }
     // Insert or update block
     const result = await queryOne<{ id: string }>(
       `INSERT INTO blocks (
