@@ -48,10 +48,6 @@ export function getIndexerQueue(): Queue.Queue {
         removeOnComplete: 100,
         removeOnFail: 50,
       },
-      settings: {
-        // Increase max listeners to handle multiple rate limit queues
-        maxListeners: 50,
-      },
     });
 
     // Add queue event handlers

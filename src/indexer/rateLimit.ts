@@ -106,6 +106,9 @@ export class RateLimitService {
         },
       });
 
+      // Increase max listeners to handle multiple concurrent operations
+      newQueue.setMaxListeners(50);
+
       // Process jobs immediately (just grant token)
       newQueue.process(async (job: Job<TokenJob>) => {
         // Token granted - job completes immediately
