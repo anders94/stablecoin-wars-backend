@@ -28,6 +28,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Detect the "too many logs" style error that execution clients return when an
+// eth_getLogs query would exceed the node's response cap. The cap is by result
+// COUNT (e.g. 20000 logs), not by block count, so block-based chunking alone
+// cannot guarantee a query fits — we detect this and bisect the range instead.
+// Different clients phrase this differently (geth/erigon/nethermind/providers).
+function isTooManyLogsError(error: unknown): boolean {
+  const msg = ((error as Error)?.message || String(error)).toLowerCase();
+  return (
+    msg.includes('too many logs') ||
+    msg.includes('query returned more than') ||
+    msg.includes('response size exceed') ||
+    msg.includes('log response size exceeded') ||
+    (msg.includes('more than') && msg.includes('results')) ||
+    (msg.includes('exceed') && msg.includes('limit'))
+  );
+}
+
 // Helper function to add timeout to promises
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operationName: string): Promise<T> {
   return Promise.race([
@@ -251,6 +268,37 @@ export class EVMAdapter implements BlockchainAdapter {
     return supply.toString();
   }
 
+  // Fetch Transfer logs for a block range, bisecting on the node's result-count
+  // cap. Block-based chunking can't guarantee a query stays under the cap for a
+  // busy token, so when we hit "too many logs" we split the range in half and
+  // retry each half recursively until every sub-query fits.
+  private async queryTransferLogs(
+    contract: Contract,
+    start: number,
+    end: number
+  ): Promise<(ethers.EventLog | ethers.Log)[]> {
+    await this.acquireRateLimitToken(`eth_getLogs (Transfer ${start}-${end})`);
+    const filter = contract.filters.Transfer();
+    try {
+      return await withTimeout(
+        contract.queryFilter(filter, start, end),
+        RPC_TIMEOUT_MS,
+        `queryFilter Transfer ${start}-${end}`
+      );
+    } catch (error) {
+      if (isTooManyLogsError(error) && start < end) {
+        const mid = Math.floor((start + end) / 2);
+        StatusLineReporter.getInstance().log(
+          `  eth_getLogs cap hit for ${start}-${end}, splitting into ${start}-${mid} / ${mid + 1}-${end}`
+        );
+        const left = await this.queryTransferLogs(contract, start, mid);
+        const right = await this.queryTransferLogs(contract, mid + 1, end);
+        return [...left, ...right];
+      }
+      throw error;
+    }
+  }
+
   async getTransferEvents(
     address: string,
     fromBlock: number,
@@ -270,13 +318,7 @@ export class EVMAdapter implements BlockchainAdapter {
 
       const end = Math.min(start + MAX_BLOCK_RANGE - 1, toBlock);
 
-      await this.acquireRateLimitToken(`eth_getLogs (Transfer ${start}-${end})`);
-      const filter = contract.filters.Transfer();
-      const logs = await withTimeout(
-        contract.queryFilter(filter, start, end),
-        RPC_TIMEOUT_MS,
-        `queryFilter Transfer ${start}-${end}`
-      );
+      const logs = await this.queryTransferLogs(contract, start, end);
 
       for (const log of logs) {
         await this.acquireRateLimitToken(`eth_getBlockByHash (${log.blockHash.slice(0, 10)}...)`);
