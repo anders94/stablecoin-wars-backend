@@ -320,13 +320,20 @@ export class EVMAdapter implements BlockchainAdapter {
 
       const logs = await this.queryTransferLogs(contract, start, end);
 
+      // Many logs share a block, so fetch each block's timestamp only once
+      const timestamps = new Map<string, number>();
       for (const log of logs) {
+        if (timestamps.has(log.blockHash)) continue;
         await this.acquireRateLimitToken(`eth_getBlockByHash (${log.blockHash.slice(0, 10)}...)`);
         const block = await withTimeout(
           log.getBlock(),
           RPC_TIMEOUT_MS,
           `getBlock for tx ${log.transactionHash}`
         );
+        timestamps.set(log.blockHash, block.timestamp);
+      }
+
+      for (const log of logs) {
         const parsed = contract.interface.parseLog({
           topics: log.topics as string[],
           data: log.data,
@@ -339,7 +346,7 @@ export class EVMAdapter implements BlockchainAdapter {
             from: parsed.args[0],
             to: parsed.args[1],
             value: parsed.args[2].toString(),
-            timestamp: block.timestamp,
+            timestamp: timestamps.get(log.blockHash)!,
           });
         }
       }

@@ -22,10 +22,6 @@ async function main() {
 
   const queue = getIndexerQueue();
 
-  // Increase max listeners to handle multiple rate limit queues
-  // Each rate limiter queue adds listeners, and we may have many RPC endpoints
-  queue.setMaxListeners(50);
-
   // Keep queue paused during initialization to prevent race conditions
   await queue.pause(true); // Pause both locally and globally
   StatusLineReporter.getInstance().log('Queue paused for initialization');

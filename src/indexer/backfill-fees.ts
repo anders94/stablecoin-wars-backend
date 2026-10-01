@@ -8,11 +8,7 @@ const BATCH_SIZE = 100; // Process 100 blocks at a time
 async function main() {
   console.log('Starting fee backfill for blocks with mints/burns...');
 
-  const rateLimitService = new RateLimitService({
-    host: process.env.REDIS_HOST || 'localhost',
-    port: parseInt(process.env.REDIS_PORT || '6379'),
-    password: process.env.REDIS_PASSWORD,
-  });
+  const rateLimitService = new RateLimitService();
 
   try {
     // Get all contracts

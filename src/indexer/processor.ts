@@ -14,11 +14,7 @@ import { StatusLineReporter } from './statusLineReporter';
 const SECONDS_PER_DAY = 86400;
 
 // Rate limiter singleton
-const rateLimiter = new RateLimitService({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: parseInt(process.env.REDIS_PORT || '6379'),
-  password: process.env.REDIS_PASSWORD,
-});
+const rateLimiter = new RateLimitService();
 
 interface ContractWithNetwork extends Contract {
   chain_type: 'evm' | 'tron' | 'solana';
@@ -258,16 +254,15 @@ export async function syncContract(contractId: string): Promise<void> {
         toBlock
       );
 
-      // Get mint/burn events
-      const { mints, burns } = await adapter.getMintBurnEvents(
-        contract.contract_address,
-        fromBlock,
-        toBlock
-      );
-
-      // Filter out mints and burns from transfers to avoid double counting
-      // Mints are from 0x0, burns are to 0x0
+      // Split mints (from 0x0) and burns (to 0x0) out of the transfers rather than
+      // refetching the same range, and keep them out of transfers to avoid double counting
       const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+      const mints = allTransfers
+        .filter(t => t.from === ZERO_ADDRESS)
+        .map(t => ({ blockNumber: t.blockNumber, txHash: t.txHash, to: t.to, value: t.value, timestamp: t.timestamp }));
+      const burns = allTransfers
+        .filter(t => t.from !== ZERO_ADDRESS && t.to === ZERO_ADDRESS)
+        .map(t => ({ blockNumber: t.blockNumber, txHash: t.txHash, from: t.from, value: t.value, timestamp: t.timestamp }));
       const transfers = allTransfers.filter(t =>
         t.from !== ZERO_ADDRESS && t.to !== ZERO_ADDRESS
       );
