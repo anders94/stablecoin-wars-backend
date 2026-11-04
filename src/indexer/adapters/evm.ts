@@ -1,7 +1,7 @@
 import { ethers, Contract, Provider, JsonRpcProvider } from 'ethers';
 import { BlockchainAdapter, registerAdapter } from './base';
 import { ChainType, TransferEvent, MintEvent, BurnEvent } from '../../types';
-import { isShutdownRequested } from '../worker';
+import { isShutdownRequested } from '../shutdown';
 import { RateLimitService } from '../rateLimit';
 import { StatusLineReporter } from '../statusLineReporter';
 

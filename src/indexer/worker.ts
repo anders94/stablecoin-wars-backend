@@ -6,16 +6,11 @@ import { discoverContract, syncContract } from './processor';
 import { aggregateMetrics, runFullAggregation } from './aggregator';
 import { closePool } from '../db';
 import { StatusLineReporter } from './statusLineReporter';
+import { isShutdownRequested, requestShutdown } from './shutdown';
 
 // Import adapters to register them
 import './adapters';
 
-// Global shutdown flag
-let isShuttingDown = false;
-
-export function isShutdownRequested(): boolean {
-  return isShuttingDown;
-}
 
 async function main() {
   StatusLineReporter.getInstance().log('Starting Stablecoin Wars Indexer Worker...');
@@ -200,7 +195,6 @@ async function main() {
         }, {
           attempts: 3,
           backoff: { type: 'exponential', delay: 5000 },
-          timeout: 86400000, // 24 hour timeout for sync (large contracts need time)
           jobId,
         });
       }
@@ -335,7 +329,6 @@ async function main() {
         }, {
           attempts: 3,
           backoff: { type: 'exponential', delay: 5000 },
-          timeout: 86400000, // 24 hour timeout for sync (large contracts need time)
           jobId,
         });
       }
@@ -348,13 +341,13 @@ async function main() {
 
   // Graceful shutdown
   const shutdown = async () => {
-    if (isShuttingDown) {
+    if (isShutdownRequested()) {
       StatusLineReporter.getInstance().log('Shutdown already in progress...');
       return;
     }
 
     console.log('Shutting down indexer worker...');
-    isShuttingDown = true;
+    requestShutdown();
 
     // Stop the status line reporter
     StatusLineReporter.getInstance().stop();

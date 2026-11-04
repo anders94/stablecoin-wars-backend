@@ -2,7 +2,7 @@ import { PoolClient } from 'pg';
 import { createAdapter, BlockchainAdapter } from './adapters';
 import { transaction, queryOne, execute } from '../db';
 import { Contract, Network, SyncState, RESOLUTIONS, TransferEvent } from '../types';
-import { isShutdownRequested } from './worker';
+import { isShutdownRequested } from './shutdown';
 import { RateLimitService } from './rateLimit';
 import { StatusLineReporter } from './statusLineReporter';
 
@@ -225,14 +225,8 @@ export async function syncContract(contractId: string): Promise<void> {
     while (fromBlock <= currentBlock) {
       // Check for shutdown request
       if (isShutdownRequested()) {
+        // No sync_state write needed: each committed chunk already recorded its progress
         StatusLineReporter.getInstance().log(`Shutdown requested, stopping sync for ${contract.stablecoin_name} on ${contract.network_name} at block ${fromBlock}`);
-        // Update sync state before exiting
-        await execute(
-          `UPDATE sync_state
-           SET last_synced_block = $1, last_synced_at = NOW(), updated_at = NOW()
-           WHERE contract_id = $2`,
-          [fromBlock - 1, contractId]
-        );
         return;
       }
 
@@ -247,50 +241,42 @@ export async function syncContract(contractId: string): Promise<void> {
 
       StatusLineReporter.getInstance().log(`[${progress}%] Processing blocks ${fromBlock.toLocaleString()} to ${toBlock.toLocaleString()} (${blockDateTime})...`);
 
-      // Get all transfer events in this range
-      const allTransfers = await adapter.getTransferEvents(
-        contract.contract_address,
-        fromBlock,
-        toBlock
-      );
-
-      // Split mints (from 0x0) and burns (to 0x0) out of the transfers rather than
-      // refetching the same range, and keep them out of transfers to avoid double counting
-      const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
-      const mints = allTransfers
-        .filter(t => t.from === ZERO_ADDRESS)
-        .map(t => ({ blockNumber: t.blockNumber, txHash: t.txHash, to: t.to, value: t.value, timestamp: t.timestamp }));
-      const burns = allTransfers
-        .filter(t => t.from !== ZERO_ADDRESS && t.to === ZERO_ADDRESS)
-        .map(t => ({ blockNumber: t.blockNumber, txHash: t.txHash, from: t.from, value: t.value, timestamp: t.timestamp }));
-      const transfers = allTransfers.filter(t =>
-        t.from !== ZERO_ADDRESS && t.to !== ZERO_ADDRESS
-      );
+      const chunk = await fetchChunk(adapter, contract.contract_address, fromBlock, toBlock);
+      const { transfers, mints, burns } = chunk;
 
       totalTransfers += transfers.length;
       totalMints += mints.length;
       totalBurns += burns.length;
 
-      if (transfers.length > 0 || mints.length > 0 || burns.length > 0) {
-        StatusLineReporter.getInstance().log(`  Found ${transfers.length} transfers, ${mints.length} mints, ${burns.length} burns`);
+      // Write the chunk and advance sync_state atomically. The writes are additive, so a chunk
+      // must never be applied twice: lock the sync_state row and only proceed if it still points
+      // at the block just before this chunk. If another sync loop for this contract already moved
+      // it (e.g. a timed-out job whose promise kept running), this loop stops instead.
+      const applied = await transaction(async (client) => {
+        const state = await client.query<{ last_synced_block: string }>(
+          'SELECT last_synced_block FROM sync_state WHERE contract_id = $1 FOR UPDATE',
+          [contractId]
+        );
+        if (Number(state.rows[0]?.last_synced_block) !== fromBlock - 1) {
+          return false;
+        }
+
+        await writeChunk(client, contractId, chunk, fromBlock, toBlock);
+
+        await client.query(
+          `UPDATE sync_state
+           SET last_synced_block = $1, last_synced_at = NOW(), updated_at = NOW()
+           WHERE contract_id = $2`,
+          [toBlock, contractId]
+        );
+        return true;
+      });
+
+      if (!applied) {
+        StatusLineReporter.getInstance().log(`  sync_state for ${contract.stablecoin_name} on ${contract.network_name} moved past block ${fromBlock - 1} under another sync; stopping this one`);
+        return;
       }
-
-      // Process into daily metrics
-      StatusLineReporter.getInstance().log(`  Processing events into daily metrics...`);
-      await processEvents(contractId, transfers, mints, burns, contract.decimals, adapter);
-
-      // Process into block summaries (including blocks with no activity)
-      StatusLineReporter.getInstance().log(`  Processing block summaries...`);
-      await processBlockSummaries(contractId, transfers, mints, burns, contract.decimals, adapter, fromBlock, toBlock);
       StatusLineReporter.getInstance().log(`  Completed processing batch`);
-
-      // Update sync state
-      await execute(
-        `UPDATE sync_state
-         SET last_synced_block = $1, last_synced_at = NOW(), updated_at = NOW()
-         WHERE contract_id = $2`,
-        [toBlock, contractId]
-      );
 
       fromBlock = toBlock + 1;
     }
@@ -333,13 +319,82 @@ export async function syncContract(contractId: string): Promise<void> {
   }
 }
 
+export interface ChunkData {
+  transfers: TransferEvent[];
+  mints: { blockNumber: number; txHash: string; to: string; value: string; timestamp: number }[];
+  burns: { blockNumber: number; txHash: string; from: string; value: string; timestamp: number }[];
+  fees: Map<string, { feeNative: string; feeUsd: string | null }>;
+}
+
+/**
+ * Fetch everything needed to index a block range: transfer events (split into plain
+ * transfers, mints and burns) and the fee for every transaction involved.
+ */
+export async function fetchChunk(
+  adapter: BlockchainAdapter,
+  contractAddress: string,
+  fromBlock: number,
+  toBlock: number
+): Promise<ChunkData> {
+  const allTransfers = await adapter.getTransferEvents(contractAddress, fromBlock, toBlock);
+
+  // Split mints (from 0x0) and burns (to 0x0) out of the transfers rather than
+  // refetching the same range, and keep them out of transfers to avoid double counting
+  const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+  const mints = allTransfers
+    .filter(t => t.from === ZERO_ADDRESS)
+    .map(t => ({ blockNumber: t.blockNumber, txHash: t.txHash, to: t.to, value: t.value, timestamp: t.timestamp }));
+  const burns = allTransfers
+    .filter(t => t.from !== ZERO_ADDRESS && t.to === ZERO_ADDRESS)
+    .map(t => ({ blockNumber: t.blockNumber, txHash: t.txHash, from: t.from, value: t.value, timestamp: t.timestamp }));
+  const transfers = allTransfers.filter(t =>
+    t.from !== ZERO_ADDRESS && t.to !== ZERO_ADDRESS
+  );
+
+  if (transfers.length > 0 || mints.length > 0 || burns.length > 0) {
+    StatusLineReporter.getInstance().log(`  Found ${transfers.length} transfers, ${mints.length} mints, ${burns.length} burns`);
+  }
+
+  // Fetch fees once for every tx in the chunk; both metrics and block summaries use them
+  const txHashes = new Set(allTransfers.map(t => t.txHash));
+  let fees = new Map<string, { feeNative: string; feeUsd: string | null }>();
+  if (txHashes.size > 0) {
+    StatusLineReporter.getInstance().log(`  Getting fees for ${txHashes.size} transactions...`);
+    fees = await adapter.getTransactionFees(Array.from(txHashes));
+  }
+
+  return { transfers, mints, burns, fees };
+}
+
+/**
+ * Add a fetched chunk to the daily metrics and block summaries. The writes are additive,
+ * so the caller must make sure a range is never applied twice (run inside a transaction
+ * that also records the range as done, or that first deletes the range's existing rows).
+ */
+export async function writeChunk(
+  client: PoolClient,
+  contractId: string,
+  chunk: ChunkData,
+  fromBlock: number,
+  toBlock: number
+): Promise<void> {
+  const { transfers, mints, burns, fees } = chunk;
+
+  StatusLineReporter.getInstance().log(`  Processing events into daily metrics...`);
+  await processEvents(client, contractId, transfers, mints, burns, fees);
+
+  // Block summaries include blocks with no activity
+  StatusLineReporter.getInstance().log(`  Processing block summaries...`);
+  await processBlockSummaries(client, contractId, transfers, mints, burns, fees, fromBlock, toBlock);
+}
+
 async function processEvents(
+  client: PoolClient,
   contractId: string,
   transfers: TransferEvent[],
   mints: { blockNumber: number; txHash: string; to: string; value: string; timestamp: number }[],
   burns: { blockNumber: number; txHash: string; from: string; value: string; timestamp: number }[],
-  _decimals: number,
-  adapter: BlockchainAdapter
+  fees: Map<string, { feeNative: string; feeUsd: string | null }>
 ): Promise<void> {
   if (transfers.length === 0 && mints.length === 0 && burns.length === 0) {
     return;
@@ -379,14 +434,12 @@ async function processEvents(
   };
 
   // Process transfers
-  const txHashes = new Set<string>();
   for (const transfer of transfers) {
     const daily = getOrCreateDaily(transfer.timestamp, transfer.blockNumber);
     daily.txCount++;
     daily.senders.add(transfer.from);
     daily.receivers.add(transfer.to);
     daily.totalTransferred += BigInt(transfer.value);
-    txHashes.add(transfer.txHash);
   }
 
   // Process mints
@@ -401,22 +454,18 @@ async function processEvents(
     daily.burned += BigInt(burn.value);
   }
 
-  // Get transaction fees (batch)
-  if (txHashes.size > 0) {
-    const fees = await adapter.getTransactionFees(Array.from(txHashes));
-
-    for (const transfer of transfers) {
-      const fee = fees.get(transfer.txHash);
-      if (fee) {
-        const daily = getOrCreateDaily(transfer.timestamp, transfer.blockNumber);
-        daily.totalFeesNative += BigInt(fee.feeNative);
-      }
+  // Add transaction fees
+  for (const transfer of transfers) {
+    const fee = fees.get(transfer.txHash);
+    if (fee) {
+      const daily = getOrCreateDaily(transfer.timestamp, transfer.blockNumber);
+      daily.totalFeesNative += BigInt(fee.feeNative);
     }
   }
 
   // Upsert daily metrics to database
   for (const [_key, daily] of dailyMetrics) {
-    await execute(
+    await client.query(
       `INSERT INTO metrics (
         contract_id, period_start, resolution_seconds,
         minted, burned, tx_count, unique_senders, unique_receivers,
@@ -453,12 +502,12 @@ async function processEvents(
 }
 
 async function processBlockSummaries(
+  client: PoolClient,
   contractId: string,
   transfers: TransferEvent[],
   mints: { blockNumber: number; txHash: string; to: string; value: string; timestamp: number }[],
   burns: { blockNumber: number; txHash: string; from: string; value: string; timestamp: number }[],
-  _decimals: number,
-  adapter: BlockchainAdapter,
+  fees: Map<string, { feeNative: string; feeUsd: string | null }>,
   fromBlock: number,
   toBlock: number
 ): Promise<void> {
@@ -490,14 +539,12 @@ async function processBlockSummaries(
   };
 
   // Process transfers
-  const txHashes = new Set<string>();
   for (const transfer of transfers) {
     const block = getOrCreateBlock(transfer.blockNumber, transfer.timestamp);
     block.txCount++;
     block.senders.add(transfer.from);
     block.receivers.add(transfer.to);
     block.totalTransferred += BigInt(transfer.value);
-    txHashes.add(transfer.txHash);
   }
 
   // Process mints
@@ -506,7 +553,6 @@ async function processBlockSummaries(
     block.minted += BigInt(mint.value);
     block.receivers.add(mint.to);
     block.txCount++;
-    txHashes.add(mint.txHash);
   }
 
   // Process burns
@@ -515,38 +561,30 @@ async function processBlockSummaries(
     block.burned += BigInt(burn.value);
     block.senders.add(burn.from);
     block.txCount++;
-    txHashes.add(burn.txHash);
   }
 
-  // Get transaction fees (batch)
-  if (txHashes.size > 0) {
-    StatusLineReporter.getInstance().log(`    Getting fees for ${txHashes.size} transactions...`);
-    const fees = await adapter.getTransactionFees(Array.from(txHashes));
-    StatusLineReporter.getInstance().log(`    Retrieved fees, now writing blocks to database...`);
-
-    // Add fees for all transactions (transfers, mints, burns)
-    for (const transfer of transfers) {
-      const fee = fees.get(transfer.txHash);
-      if (fee) {
-        const block = getOrCreateBlock(transfer.blockNumber, transfer.timestamp);
-        block.totalFeesNative += BigInt(fee.feeNative);
-      }
+  // Add fees for all transactions (transfers, mints, burns)
+  for (const transfer of transfers) {
+    const fee = fees.get(transfer.txHash);
+    if (fee) {
+      const block = getOrCreateBlock(transfer.blockNumber, transfer.timestamp);
+      block.totalFeesNative += BigInt(fee.feeNative);
     }
+  }
 
-    for (const mint of mints) {
-      const fee = fees.get(mint.txHash);
-      if (fee) {
-        const block = getOrCreateBlock(mint.blockNumber, mint.timestamp);
-        block.totalFeesNative += BigInt(fee.feeNative);
-      }
+  for (const mint of mints) {
+    const fee = fees.get(mint.txHash);
+    if (fee) {
+      const block = getOrCreateBlock(mint.blockNumber, mint.timestamp);
+      block.totalFeesNative += BigInt(fee.feeNative);
     }
+  }
 
-    for (const burn of burns) {
-      const fee = fees.get(burn.txHash);
-      if (fee) {
-        const block = getOrCreateBlock(burn.blockNumber, burn.timestamp);
-        block.totalFeesNative += BigInt(fee.feeNative);
-      }
+  for (const burn of burns) {
+    const fee = fees.get(burn.txHash);
+    if (fee) {
+      const block = getOrCreateBlock(burn.blockNumber, burn.timestamp);
+      block.totalFeesNative += BigInt(fee.feeNative);
     }
   }
 
@@ -561,7 +599,7 @@ async function processBlockSummaries(
       StatusLineReporter.getInstance().log(`      Writing block ${blockIndex}/${totalBlocks} to database...`);
     }
     // Insert or update block
-    const result = await queryOne<{ id: string }>(
+    const result = (await client.query<{ id: string }>(
       `INSERT INTO blocks (
         contract_id, block_number, timestamp,
         minted, burned, tx_count, total_transferred, total_fees_native, total_supply
@@ -586,7 +624,7 @@ async function processBlockSummaries(
         block.totalFeesNative.toString(),
         block.totalSupply,
       ]
-    );
+    )).rows[0];
 
     if (!result) {
       continue;
@@ -612,7 +650,7 @@ async function processBlockSummaries(
 
     // Batch insert addresses
     for (const [address, addressType] of allAddresses) {
-      await execute(
+      await client.query(
         `INSERT INTO block_addresses (contract_id, block_id, address, address_type)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (block_id, address) DO NOTHING`,
