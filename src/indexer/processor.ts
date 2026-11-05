@@ -1,6 +1,6 @@
 import { PoolClient } from 'pg';
 import { createAdapter, BlockchainAdapter } from './adapters';
-import { transaction, queryOne, execute } from '../db';
+import { transaction, withDatabaseRetry, queryOne, execute } from '../db';
 import { Contract, Network, SyncState, RESOLUTIONS, TransferEvent } from '../types';
 import { isShutdownRequested } from './shutdown';
 import { RateLimitService } from './rateLimit';
@@ -252,12 +252,20 @@ export async function syncContract(contractId: string): Promise<void> {
       // must never be applied twice: lock the sync_state row and only proceed if it still points
       // at the block just before this chunk. If another sync loop for this contract already moved
       // it (e.g. a timed-out job whose promise kept running), this loop stops instead.
-      const applied = await transaction(async (client) => {
+      // If the database goes away mid-write the transaction rolls back, so wait for it to come
+      // back and retry the write with the chunk already in memory.
+      const applied = await withDatabaseRetry(`write of blocks ${fromBlock}-${toBlock}`, () => transaction(async (client) => {
         const state = await client.query<{ last_synced_block: string }>(
           'SELECT last_synced_block FROM sync_state WHERE contract_id = $1 FOR UPDATE',
           [contractId]
         );
-        if (Number(state.rows[0]?.last_synced_block) !== fromBlock - 1) {
+        const lastSynced = Number(state.rows[0]?.last_synced_block);
+        if (lastSynced === toBlock) {
+          // Already written: the connection dropped after COMMIT reached the server but before
+          // we saw the reply, and this is the retry
+          return true;
+        }
+        if (lastSynced !== fromBlock - 1) {
           return false;
         }
 
@@ -270,7 +278,7 @@ export async function syncContract(contractId: string): Promise<void> {
           [toBlock, contractId]
         );
         return true;
-      });
+      }));
 
       if (!applied) {
         StatusLineReporter.getInstance().log(`  sync_state for ${contract.stablecoin_name} on ${contract.network_name} moved past block ${fromBlock - 1} under another sync; stopping this one`);
