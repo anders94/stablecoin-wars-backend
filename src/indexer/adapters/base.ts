@@ -39,8 +39,9 @@ export interface BlockchainAdapter {
     feeUsd: string | null;
   }>;
 
-  // Batch transaction fees (more efficient)
-  getTransactionFees(txHashes: string[]): Promise<Map<string, { feeNative: string; feeUsd: string | null }>>;
+  // Batch transaction fees (more efficient). blockNumbers, when given, are the blocks containing
+  // txHashes; adapters that can fetch all of a block's receipts in one call use them.
+  getTransactionFees(txHashes: string[], blockNumbers?: number[]): Promise<Map<string, { feeNative: string; feeUsd: string | null }>>;
 }
 
 /**
@@ -125,9 +126,9 @@ export class RateLimitedAdapter implements BlockchainAdapter {
     return this.inner.getTransactionFee(txHash);
   }
 
-  async getTransactionFees(txHashes: string[]): Promise<Map<string, { feeNative: string; feeUsd: string | null }>> {
+  async getTransactionFees(txHashes: string[], blockNumbers?: number[]): Promise<Map<string, { feeNative: string; feeUsd: string | null }>> {
     await this.rateLimiter.acquireToken(this.endpointId, this.maxRequestsPerSecond);
-    return this.inner.getTransactionFees(txHashes);
+    return this.inner.getTransactionFees(txHashes, blockNumbers);
   }
 }
 

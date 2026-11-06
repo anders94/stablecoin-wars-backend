@@ -5,6 +5,7 @@ interface RpcCallCounts {
   eth_getLogs: number;
   eth_getBlockByHash: number;
   eth_getTransactionReceipt: number;
+  eth_getBlockReceipts: number;
   eth_getCode: number;
   eth_call: number;
   eth_getBlockByNumber: number;
@@ -23,6 +24,7 @@ export class StatusLineReporter {
     eth_getLogs: 0,
     eth_getBlockByHash: 0,
     eth_getTransactionReceipt: 0,
+    eth_getBlockReceipts: 0,
     eth_getCode: 0,
     eth_call: 0,
     eth_getBlockByNumber: 0,
@@ -155,6 +157,7 @@ export class StatusLineReporter {
       eth_getLogs: 'getLogs',
       eth_getBlockByHash: 'getBlock',
       eth_getTransactionReceipt: 'getReceipt',
+      eth_getBlockReceipts: 'getBlockReceipts',
       eth_getCode: 'getCode',
       eth_call: 'call',
       eth_getBlockByNumber: 'getBlockNum',
@@ -247,6 +250,7 @@ export class StatusLineReporter {
       eth_getLogs: 0,
       eth_getBlockByHash: 0,
       eth_getTransactionReceipt: 0,
+    eth_getBlockReceipts: 0,
       eth_getCode: 0,
       eth_call: 0,
       eth_getBlockByNumber: 0,

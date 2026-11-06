@@ -365,10 +365,11 @@ export async function fetchChunk(
 
   // Fetch fees once for every tx in the chunk; both metrics and block summaries use them
   const txHashes = new Set(allTransfers.map(t => t.txHash));
+  const blockNumbers = new Set(allTransfers.map(t => t.blockNumber));
   let fees = new Map<string, { feeNative: string; feeUsd: string | null }>();
   if (txHashes.size > 0) {
-    StatusLineReporter.getInstance().log(`  Getting fees for ${txHashes.size} transactions...`);
-    fees = await adapter.getTransactionFees(Array.from(txHashes));
+    StatusLineReporter.getInstance().log(`  Getting fees for ${txHashes.size} transactions in ${blockNumbers.size} blocks...`);
+    fees = await adapter.getTransactionFees(Array.from(txHashes), Array.from(blockNumbers));
   }
 
   return { transfers, mints, burns, fees };

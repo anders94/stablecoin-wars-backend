@@ -1,4 +1,4 @@
-import { ethers, Contract, Provider, JsonRpcProvider } from 'ethers';
+import { ethers, Contract, Provider, JsonRpcProvider, toQuantity } from 'ethers';
 import { BlockchainAdapter, registerAdapter } from './base';
 import { ChainType, TransferEvent, MintEvent, BurnEvent } from '../../types';
 import { isShutdownRequested } from '../shutdown';
@@ -22,6 +22,8 @@ const MAX_BLOCK_RANGE = 10000;
 // Transaction receipt retry settings
 const MAX_RECEIPT_RETRIES = 5;
 const INITIAL_RETRY_DELAY_MS = 500;
+// Below this many of our transactions per block on average, fetch receipts one by one instead
+const MIN_TXS_PER_BLOCK_FOR_BLOCK_RECEIPTS = 4;
 
 // Helper function to sleep
 function sleep(ms: number): Promise<void> {
@@ -447,7 +449,107 @@ export class EVMAdapter implements BlockchainAdapter {
     throw lastError || new Error(`Transaction ${txHash} not found after ${MAX_RECEIPT_RETRIES} attempts`);
   }
 
-  async getTransactionFees(txHashes: string[]): Promise<Map<string, { feeNative: string; feeUsd: string | null }>> {
+  /**
+   * Fees for every transaction in a block, from a single eth_getBlockReceipts call.
+   * Retries with backoff like getTransactionFee and throws once retries are exhausted.
+   */
+  private async getBlockReceiptFees(blockNumber: number): Promise<Map<string, { feeNative: string; feeUsd: string | null }>> {
+    const provider = this.getProvider();
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < MAX_RECEIPT_RETRIES; attempt++) {
+      if (isShutdownRequested()) {
+        throw new Error('Shutdown requested');
+      }
+
+      try {
+        await this.acquireRateLimitToken(`eth_getBlockReceipts (${blockNumber})`);
+        const receipts = await withTimeout(
+          provider.send('eth_getBlockReceipts', [toQuantity(blockNumber)]) as Promise<
+            { transactionHash: string; gasUsed: string; effectiveGasPrice: string }[] | null
+          >,
+          RPC_TIMEOUT_MS,
+          `getBlockReceipts ${blockNumber}`
+        );
+        if (!receipts) {
+          throw new Error(`Block ${blockNumber} receipts not found`);
+        }
+
+        const fees = new Map<string, { feeNative: string; feeUsd: string | null }>();
+        for (const receipt of receipts) {
+          // Same fee as getTransactionFee: ethers' receipt.gasPrice is the effectiveGasPrice field
+          const fee = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice);
+          fees.set(receipt.transactionHash.toLowerCase(), { feeNative: fee.toString(), feeUsd: null });
+        }
+        return fees;
+      } catch (error) {
+        lastError = error as Error;
+        if (attempt < MAX_RECEIPT_RETRIES - 1) {
+          const delayMs = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
+          console.log(`  Error fetching receipts for block ${blockNumber}: ${lastError.message}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${MAX_RECEIPT_RETRIES})...`);
+          await sleep(delayMs);
+        }
+      }
+    }
+
+    throw lastError || new Error(`Receipts for block ${blockNumber} not found after ${MAX_RECEIPT_RETRIES} attempts`);
+  }
+
+  async getTransactionFees(
+    txHashes: string[],
+    blockNumbers?: number[]
+  ): Promise<Map<string, { feeNative: string; feeUsd: string | null }>> {
+    // A block's receipts cost about as much as a few single receipts (more for old blocks, which
+    // the node may re-execute), so only fetch whole blocks when they hold enough of our txs
+    if (!blockNumbers || blockNumbers.length === 0 ||
+        txHashes.length < blockNumbers.length * MIN_TXS_PER_BLOCK_FOR_BLOCK_RECEIPTS) {
+      return this.getTransactionFeesOneByOne(txHashes);
+    }
+
+    // One eth_getBlockReceipts call per block instead of one receipt call per transaction
+    const blockFees = new Map<string, { feeNative: string; feeUsd: string | null }>();
+    const batchSize = 5;
+    for (let i = 0; i < blockNumbers.length; i += batchSize) {
+      if (isShutdownRequested()) {
+        console.log('  Shutdown requested, stopping transaction fee fetch');
+        break;
+      }
+
+      await Promise.all(blockNumbers.slice(i, i + batchSize).map(async (blockNumber) => {
+        try {
+          for (const [txHash, fee] of await this.getBlockReceiptFees(blockNumber)) {
+            blockFees.set(txHash, fee);
+          }
+        } catch (error) {
+          // Its transactions are picked up one by one below
+          console.error(`Failed to get receipts for block ${blockNumber}: ${(error as Error).message}`);
+        }
+      }));
+    }
+
+    const results = new Map<string, { feeNative: string; feeUsd: string | null }>();
+    const missing: string[] = [];
+    for (const txHash of txHashes) {
+      const fee = blockFees.get(txHash.toLowerCase());
+      if (fee) {
+        results.set(txHash, fee);
+      } else {
+        missing.push(txHash);
+      }
+    }
+
+    // Anything not covered (a failed block, or a hash outside the given blocks) goes one by one
+    if (missing.length > 0 && !isShutdownRequested()) {
+      console.log(`  Fetching ${missing.length} receipts individually`);
+      for (const [txHash, fee] of await this.getTransactionFeesOneByOne(missing)) {
+        results.set(txHash, fee);
+      }
+    }
+
+    return results;
+  }
+
+  private async getTransactionFeesOneByOne(txHashes: string[]): Promise<Map<string, { feeNative: string; feeUsd: string | null }>> {
     const results = new Map<string, { feeNative: string; feeUsd: string | null }>();
 
     // Process in parallel batches (smaller batch to avoid overwhelming the RPC)
