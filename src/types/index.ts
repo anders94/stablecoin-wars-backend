@@ -165,6 +165,15 @@ export interface ContractLogEvent {
   args: Record<string, string>;
 }
 
+export interface ContractEventsOptions {
+  // false: leave timestamps 0 for the caller to fill in (default: fetch them)
+  timestamps?: boolean;
+  // Query [fromBlock, toBlock] as one range, splitting only if the node returns too many logs
+  exactRange?: boolean;
+  // Return Transfer addresses lowercased instead of checksummed (cheaper)
+  lowercaseAddresses?: boolean;
+}
+
 export interface ContractEvents {
   transfers: TransferEvent[];
   others: ContractLogEvent[];

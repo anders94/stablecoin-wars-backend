@@ -1,6 +1,6 @@
 import { ethers, Contract, Provider, JsonRpcProvider, toQuantity } from 'ethers';
 import { BlockchainAdapter, registerAdapter } from './base';
-import { ChainType, TransferEvent, MintEvent, BurnEvent, ContractEvents, ContractLogEvent } from '../../types';
+import { ChainType, TransferEvent, MintEvent, BurnEvent, ContractEvents, ContractLogEvent, ContractEventsOptions } from '../../types';
 import { EventSet, EventDefinition, getEventSet } from '../eventSets';
 import { isShutdownRequested } from '../shutdown';
 import { RateLimitService } from '../rateLimit';
@@ -46,7 +46,7 @@ function argValue(value: unknown): string {
 function decodeContractLog(
   iface: ethers.Interface,
   definition: EventDefinition,
-  log: ethers.Log,
+  log: RawLog,
   timestamp: number
 ): ContractLogEvent {
   const eventName = ethers.EventFragment.from(definition.abi.replace(/^event /, '')).name;
@@ -55,7 +55,7 @@ function decodeContractLog(
     const parsed = iface.parseLog({ topics: log.topics as string[], data: log.data });
     if (parsed) {
       args = {};
-      parsed.fragment.inputs.forEach((input, i) => {
+      parsed.fragment.inputs.forEach((input: ethers.ParamType, i: number) => {
         args![input.name || `arg${i}`] = argValue(parsed.args[i]);
       });
     }
@@ -76,6 +76,9 @@ function decodeContractLog(
     args: args ?? { raw_topics: log.topics.join(','), raw_data: log.data },
   };
 }
+
+// The parts of a log the adapter uses, from either ethers' getLogs or raw JSON-RPC
+type RawLog = Pick<ethers.Log, 'blockNumber' | 'blockHash' | 'index' | 'transactionHash' | 'topics' | 'data'>;
 
 // Zero address for detecting mints/burns
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -127,6 +130,8 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operationName: s
 
 // RPC call timeout - 60 seconds for most calls
 const RPC_TIMEOUT_MS = 60000;
+// Historical getLogs on a node that recomputes receipts can take well over a minute
+const LONG_RPC_TIMEOUT_MS = 180000;
 
 export class EVMAdapter implements BlockchainAdapter {
   readonly chainType: ChainType = 'evm';
@@ -351,9 +356,9 @@ export class EVMAdapter implements BlockchainAdapter {
     fromBlock: number,
     toBlock: number,
     label: string
-  ): Promise<ethers.Log[]> {
+  ): Promise<RawLog[]> {
     const provider = this.getProvider();
-    const logs: ethers.Log[] = [];
+    const logs: RawLog[] = [];
     let start = fromBlock;
     while (start <= toBlock) {
       const end = Math.min(start + this.logSpan - 1, toBlock);
@@ -386,9 +391,48 @@ export class EVMAdapter implements BlockchainAdapter {
     return logs;
   }
 
+  // Fetch logs for exactly [fromBlock, toBlock] in one query, halving the range only if the node
+  // rejects it for returning too many logs. Unlike fetchLogs it keeps no span state, so callers
+  // that size their own ranges (the event backfill) are not affected by each other.
+  private async fetchLogsBisecting(
+    address: string,
+    topic0s: string[],
+    fromBlock: number,
+    toBlock: number,
+    label: string
+  ): Promise<RawLog[]> {
+    await this.acquireRateLimitToken(`eth_getLogs (${label} ${fromBlock}-${toBlock})`);
+    try {
+      // Raw JSON-RPC: ethers' getLogs builds a formatted Log object per log (checksummed
+      // addresses etc.), which for 15k logs blocks the event loop for over a second
+      const raw = await withTimeout(
+        this.getProvider().send('eth_getLogs', [{ address, topics: [topic0s], fromBlock: toQuantity(fromBlock), toBlock: toQuantity(toBlock) }]),
+        LONG_RPC_TIMEOUT_MS,
+        `getLogs ${label} ${fromBlock}-${toBlock}`
+      ) as { blockNumber: string; blockHash: string; logIndex: string; transactionHash: string; topics: string[]; data: string; removed?: boolean }[];
+      return raw.filter(l => !l.removed).map(l => ({
+        blockNumber: parseInt(l.blockNumber, 16),
+        blockHash: l.blockHash,
+        index: parseInt(l.logIndex, 16),
+        transactionHash: l.transactionHash,
+        topics: l.topics,
+        data: l.data,
+      }));
+    } catch (error) {
+      if (!isTooManyLogsError(error) || fromBlock >= toBlock) {
+        throw error;
+      }
+      const mid = Math.floor((fromBlock + toBlock) / 2);
+      return [
+        ...await this.fetchLogsBisecting(address, topic0s, fromBlock, mid, label),
+        ...await this.fetchLogsBisecting(address, topic0s, mid + 1, toBlock, label),
+      ];
+    }
+  }
+
   // Timestamps of the blocks the logs are in. Many logs share a block, so each block is
   // fetched only once, several at a time.
-  private async fetchLogTimestamps(logs: ethers.Log[]): Promise<Map<string, number>> {
+  private async fetchLogTimestamps(logs: RawLog[]): Promise<Map<string, number>> {
     const provider = this.getProvider();
     const timestamps = new Map<string, number>();
     const blockHashes = [...new Set(logs.map(log => log.blockHash))];
@@ -434,7 +478,7 @@ export class EVMAdapter implements BlockchainAdapter {
     fromBlock: number,
     toBlock: number,
     eventSet: EventSet,
-    opts: { timestamps?: boolean } = {}
+    opts: ContractEventsOptions = {}
   ): Promise<ContractEvents> {
     const { iface, definitions } = getEventSetInterface(eventSet);
     const topic0s = [TRANSFER_TOPIC, ...definitions.keys()];
@@ -449,30 +493,30 @@ export class EVMAdapter implements BlockchainAdapter {
         break;
       }
 
-      const end = Math.min(start + MAX_BLOCK_RANGE - 1, toBlock);
-      const logs = await this.fetchLogs(address, topic0s, start, end, eventSet.name === 'erc20' ? 'Transfer' : 'events');
+      const end = opts.exactRange ? toBlock : Math.min(start + MAX_BLOCK_RANGE - 1, toBlock);
+      const label = eventSet.name === 'erc20' ? 'Transfer' : 'events';
+      const logs = opts.exactRange
+        ? await this.fetchLogsBisecting(address, topic0s, start, end, label)
+        : await this.fetchLogs(address, topic0s, start, end, label);
       const timestamps = opts.timestamps === false ? null : await this.fetchLogTimestamps(logs);
 
       for (const log of logs) {
         const timestamp = timestamps ? timestamps.get(log.blockHash)! : 0;
         const topic0 = log.topics[0];
         if (topic0 === TRANSFER_TOPIC) {
-          // Some tokens' logs share the Transfer signature with different indexing; skip what
-          // does not decode as a standard Transfer
-          let parsed: ethers.LogDescription | null = null;
-          try {
-            parsed = TRANSFER_IFACE.parseLog({ topics: log.topics as string[], data: log.data });
-          } catch {
-            parsed = null;
-          }
-          if (parsed) {
+          // Decoded by hand: ethers' parseLog costs ~65us per log, which blocks the event loop
+          // for seconds on busy ranges. Logs sharing the Transfer signature with different
+          // indexing (not from, to, value) are skipped.
+          if (log.topics.length === 3 && log.data.length === 66) {
+            const from = '0x' + log.topics[1].slice(26);
+            const to = '0x' + log.topics[2].slice(26);
             transfers.push({
               blockNumber: log.blockNumber,
               logIndex: log.index,
               txHash: log.transactionHash,
-              from: parsed.args[0] as string,
-              to: parsed.args[1] as string,
-              value: parsed.args[2].toString(),
+              from: opts.lowercaseAddresses ? from : ethers.getAddress(from),
+              to: opts.lowercaseAddresses ? to : ethers.getAddress(to),
+              value: BigInt(log.data).toString(),
               timestamp,
             });
           }

@@ -8,12 +8,20 @@
  * for blocks it has none for), and transaction fees are not fetched (tx_fee_native stays NULL).
  * Metrics and block summaries are not touched.
  *
+ * Ranges are sized from blocks.tx_count so each eth_getLogs query stays under the node's
+ * result cap: a node that recomputes receipts scans the whole range before rejecting an
+ * over-cap query, so a rejected query costs as much as a successful one. Ranges are fetched
+ * --parallel at a time and written strictly from the top down.
+ *
  * Each range is written in one transaction together with the new low_block, and inserts skip
  * events that are already stored, so the script can be stopped (Ctrl-C / SIGTERM) and re-run
  * at any time, alongside the indexer.
  *
  * Usage:
- *   ts-node src/indexer/backfill-events.ts [<contract-id>...] [--span 1000] [--parallel 4] [--rps 100]
+ *   ts-node src/indexer/backfill-events.ts [<contract-id>...] [--span 1000] [--parallel 16]
+ *     [--max-logs 15000] [--rps 200]
+ *   --span      largest block range per query (the node's eth_getLogs block-range limit)
+ *   --max-logs  target events per query, below the node's result cap
  * With no contract ids, every active contract whose live sync has started storing events.
  */
 import dotenv from 'dotenv';
@@ -25,9 +33,9 @@ import { RateLimitService } from './rateLimit';
 import { getEventSet, EventSet } from './eventSets';
 import { buildEventRows, insertEventRows, splitTransfers } from './eventRows';
 import { isShutdownRequested, requestShutdown } from './shutdown';
-import { ContractEvents } from '../types';
+import { ContractEvents, RESOLUTIONS } from '../types';
 
-interface ContractConfig {
+export interface ContractConfig {
   id: string;
   contract_address: string;
   creation_block: string | null;
@@ -40,29 +48,41 @@ interface ContractConfig {
   events_from_block: string | null;
 }
 
-interface Options {
+export interface Options {
   span: number;
   parallel: number;
+  maxLogs: number;
   rps: number;
 }
 
-interface FetchedRange {
+interface PlannedRange {
   from: number;
   to: number;
+  expected: number;
+  timestamps: Map<number, number>;
+}
+
+interface FetchedRange extends PlannedRange {
   events: ContractEvents;
 }
 
+const PLAN_WINDOW_BLOCKS = 50000;
+const FETCH_ATTEMPTS = 6;
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 function parseArgs(argv: string[]): { contractIds: string[]; options: Options } {
-  const options: Options = { span: 1000, parallel: 4, rps: 100 };
+  const options: Options = { span: 1000, parallel: 16, maxLogs: 15000, rps: 200 };
+  const flags: Record<string, keyof Options> = { '--span': 'span', '--parallel': 'parallel', '--max-logs': 'maxLogs', '--rps': 'rps' };
   const contractIds: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--span' || arg === '--parallel' || arg === '--rps') {
+    if (flags[arg]) {
       const value = Number(argv[++i]);
       if (!Number.isFinite(value) || value <= 0) {
         throw new Error(`${arg} needs a positive number`);
       }
-      options[arg.slice(2) as keyof Options] = value;
+      options[flags[arg]] = value;
     } else if (/^[0-9a-f-]{36}$/i.test(arg)) {
       contractIds.push(arg);
     } else {
@@ -73,30 +93,109 @@ function parseArgs(argv: string[]): { contractIds: string[]; options: Options } 
 }
 
 /**
- * Fill in timestamps (fetched without them) from the blocks table, asking the node only for
- * blocks the table has no timestamp for.
+ * Splits [target, top] into ranges, highest first, each expected to hold at most maxLogs events
+ * (blocks.tx_count counts transfers, mints and burns; administrative logs add a few more, which
+ * the margin below the node's cap absorbs). Reads the blocks table a window at a time and keeps
+ * each block's timestamp for the range that contains it.
  */
-async function fillTimestamps(adapter: BlockchainAdapter, contractId: string, events: ContractEvents): Promise<void> {
-  const all = [...events.transfers, ...events.others];
-  if (all.length === 0) {
-    return;
+export class RangePlanner {
+  private rows: { block: number; events: number; epoch: number | null }[] = [];
+  private next: number;
+
+  constructor(private contractId: string, top: number, private target: number, private options: Options) {
+    this.next = top;
   }
-  const blockNumbers = [...new Set(all.map(e => e.blockNumber))];
-  const rows = await query<{ block_number: string; epoch: number }>(
-    `SELECT block_number, extract(epoch FROM timestamp)::double precision AS epoch
-     FROM blocks
-     WHERE contract_id = $1 AND block_number = ANY($2::bigint[]) AND timestamp IS NOT NULL`,
-    [contractId, blockNumbers]
-  );
-  const timestamps = new Map(rows.map(r => [Number(r.block_number), Number(r.epoch)]));
-  for (const blockNumber of blockNumbers) {
-    if (!timestamps.has(blockNumber)) {
-      timestamps.set(blockNumber, await adapter.getBlockTimestamp(blockNumber));
+
+  private async loadWindow(): Promise<void> {
+    const low = Math.max(this.target, this.next - PLAN_WINDOW_BLOCKS + 1);
+    const rows = await withDatabaseRetry('backfill range planning', () => query<{ block_number: string; tx_count: number; epoch: number | null }>(
+      `SELECT block_number, tx_count, extract(epoch FROM timestamp)::double precision AS epoch
+       FROM blocks WHERE contract_id = $1 AND block_number BETWEEN $2 AND $3
+       ORDER BY block_number DESC`,
+      [this.contractId, low, this.next]
+    ));
+    const byBlock = new Map(rows.map(r => [Number(r.block_number), r]));
+    // Every block in the window, highest first; blocks without a row count as empty
+    for (let b = this.next; b >= low; b--) {
+      const r = byBlock.get(b);
+      this.rows.push({ block: b, events: r?.tx_count ?? 0, epoch: r?.epoch === null || r?.epoch === undefined ? null : Number(r.epoch) });
+    }
+    this.next = low - 1;
+  }
+
+  async nextRange(): Promise<PlannedRange | null> {
+    if (this.rows.length === 0) {
+      if (this.next < this.target) {
+        return null;
+      }
+      await this.loadWindow();
+    }
+    const to = this.rows[0].block;
+    let from = to;
+    let expected = 0;
+    const timestamps = new Map<number, number>();
+    while (true) {
+      if (this.rows.length === 0) {
+        if (this.next < this.target) break;
+        await this.loadWindow();
+      }
+      const row = this.rows[0];
+      const span = to - row.block + 1;
+      // Always take at least one block, then stop before exceeding the budget or the span
+      if (span > 1 && (expected + row.events > this.options.maxLogs || span > this.options.span)) break;
+      this.rows.shift();
+      from = row.block;
+      expected += row.events;
+      if (row.epoch !== null && row.events > 0) timestamps.set(row.block, row.epoch);
+    }
+    return { from, to, expected, timestamps };
+  }
+}
+
+/** Fetch a range's logs, retrying transient node errors with backoff. */
+export async function fetchRange(adapter: BlockchainAdapter, contract: ContractConfig, eventSet: EventSet, range: PlannedRange): Promise<FetchedRange> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const events = await adapter.getContractEvents!(contract.contract_address, range.from, range.to, eventSet, {
+        timestamps: false, exactRange: true, lowercaseAddresses: true,
+      });
+      // Timestamps from the blocks table; the node only for blocks the table has none for
+      for (const e of [...events.transfers, ...events.others]) {
+        let ts = range.timestamps.get(e.blockNumber);
+        if (ts === undefined) {
+          ts = await adapter.getBlockTimestamp(e.blockNumber);
+          range.timestamps.set(e.blockNumber, ts);
+        }
+        e.timestamp = ts;
+      }
+      return { ...range, events };
+    } catch (error) {
+      if (attempt >= FETCH_ATTEMPTS || isShutdownRequested()) throw error;
+      const delay = Math.min(60000, 2000 * 2 ** (attempt - 1));
+      console.log(`  blocks ${range.from}-${range.to}: ${(error as Error).message.slice(0, 160)}; retry ${attempt} in ${delay / 1000}s`);
+      await sleep(delay);
     }
   }
-  for (const e of all) {
-    e.timestamp = timestamps.get(e.blockNumber)!;
-  }
+}
+
+/** Events the metrics say exist below `block` (transfers only; mints and burns are few). */
+async function remainingEvents(contractId: string, block: number): Promise<number> {
+  const row = await queryOne<{ n: string | null }>(
+    `SELECT sum(tx_count)::text AS n FROM metrics
+     WHERE contract_id = $1 AND resolution_seconds = $2
+       AND period_start < (SELECT date_trunc('day', timestamp) FROM blocks
+                           WHERE contract_id = $1 AND block_number <= $3 AND timestamp IS NOT NULL
+                           ORDER BY block_number DESC LIMIT 1)`,
+    [contractId, RESOLUTIONS.DAY, block]
+  );
+  return Number(row?.n ?? 0);
+}
+
+function fmtDuration(seconds: number): string {
+  if (!isFinite(seconds)) return '?';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.round((seconds % 3600) / 60);
+  return h > 0 ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
 }
 
 async function backfillContract(contract: ContractConfig, eventSet: EventSet, options: Options, rateLimiter: RateLimitService) {
@@ -139,28 +238,24 @@ async function backfillContract(contract: ContractConfig, eventSet: EventSet, op
     return;
   }
 
-  console.log(`${label}: backfilling events for blocks ${target.toLocaleString()}-${(low - 1).toLocaleString()}`);
+  const totalRemaining = await remainingEvents(contract.id, low);
+  console.log(
+    `${label}: backfilling events for blocks ${target.toLocaleString()}-${(low - 1).toLocaleString()} ` +
+    `(~${totalRemaining.toLocaleString()} events), ${options.parallel} queries at a time, up to ${options.maxLogs} events each`
+  );
   await query(`UPDATE event_backfill_state SET status = 'running', updated_at = NOW() WHERE contract_id = $1`, [contract.id]);
 
-  // Ranges are fetched several at a time, highest first, and written strictly in that order
-  let nextTo = low - 1;
-  const startFetch = (): { from: number; to: number; promise: Promise<FetchedRange> } | null => {
-    if (nextTo < target) {
-      return null;
-    }
-    const to = nextTo;
-    const from = Math.max(target, to - options.span + 1);
-    nextTo = from - 1;
-    const promise = (async () => {
-      const events = await adapter.getContractEvents!(contract.contract_address, from, to, eventSet, { timestamps: false });
-      await fillTimestamps(adapter, contract.id, events);
-      return { from, to, events };
-    })();
-    promise.catch(() => {});
-    return { from, to, promise };
+  const planner = new RangePlanner(contract.id, low - 1, target, options);
+  let planning: Promise<unknown> = Promise.resolve();
+  // Ranges are planned in order (the planner is sequential) and fetched in parallel
+  const startFetch = async (): Promise<FetchedRange | null> => {
+    const planned = planning.then(() => planner.nextRange());
+    planning = planned.catch(() => {});
+    const range = await planned;
+    return range ? fetchRange(adapter, contract, eventSet, range) : null;
   };
 
-  const inFlight: NonNullable<ReturnType<typeof startFetch>>[] = [];
+  const inFlight: Promise<FetchedRange | null>[] = [];
   const startedAt = Date.now();
   const startLow = low;
   let inserted = 0;
@@ -168,20 +263,24 @@ async function backfillContract(contract: ContractConfig, eventSet: EventSet, op
 
   try {
     for (let i = 0; i < options.parallel; i++) {
-      const next = startFetch();
-      if (next) inFlight.push(next);
+      const p = startFetch();
+      p.catch(() => {});
+      inFlight.push(p);
     }
 
     while (inFlight.length > 0) {
-      const { from, to, events } = await inFlight.shift()!.promise;
+      const fetched = await inFlight.shift()!;
+      if (!fetched) continue;
       // Fetches cut short by a shutdown return partial data, so never write after one
       if (isShutdownRequested()) {
         console.log(`${label}: stopping; resume later from block ${(low - 1).toLocaleString()}`);
         return;
       }
       const next = startFetch();
-      if (next) inFlight.push(next);
+      next.catch(() => {});
+      inFlight.push(next);
 
+      const { from, to, events } = fetched;
       const rows = buildEventRows({ ...splitTransfers(events.transfers), others: events.others });
       const count = await withDatabaseRetry(`backfill write of blocks ${from}-${to}`, () => transaction(async (client) => {
         const n = await insertEventRows(client, contract.id, rows);
@@ -201,24 +300,23 @@ async function backfillContract(contract: ContractConfig, eventSet: EventSet, op
       low = from;
       inserted += count;
 
-      if (Date.now() - lastReport > 10000 || low <= target) {
+      if (Date.now() - lastReport > 30000 || low <= target) {
         lastReport = Date.now();
         const elapsed = (Date.now() - startedAt) / 1000;
-        const done = startLow - low;
-        const remaining = low - target;
-        const etaHours = done > 0 ? (remaining / (done / elapsed)) / 3600 : 0;
+        const rate = inserted / elapsed;
         const earliest = rows.reduce((min, r) => Math.min(min, r.timestamp), Infinity);
-        const latest = Number.isFinite(earliest) ? new Date(earliest * 1000).toISOString().slice(0, 10) : '';
+        const day = Number.isFinite(earliest) ? new Date(earliest * 1000).toISOString().slice(0, 10) : '';
         console.log(
-          `${label}: block ${low.toLocaleString()} ${latest} | ${inserted.toLocaleString()} events ` +
-          `(${Math.round(inserted / elapsed).toLocaleString()}/s) | ${remaining.toLocaleString()} blocks left, ~${etaHours.toFixed(1)}h`
+          `${label}: block ${low.toLocaleString()} ${day} | ${inserted.toLocaleString()} events, ` +
+          `${Math.round(rate).toLocaleString()}/s, ${Math.round((startLow - low) / elapsed)} blocks/s | ` +
+          `~${Math.max(0, totalRemaining - inserted).toLocaleString()} events left, ~${fmtDuration(Math.max(0, totalRemaining - inserted) / rate)}`
         );
       }
     }
     console.log(`${label}: backfill complete`);
   } finally {
     // Let fetches still running finish before the adapter is disconnected
-    await Promise.all(inFlight.map(f => f.promise.catch(() => {})));
+    await Promise.all(inFlight.map(f => f.catch(() => {})));
     await adapter.disconnect();
   }
 }
@@ -263,9 +361,11 @@ async function main() {
   }
 }
 
-main()
-  .catch(error => {
-    console.error(error);
-    process.exitCode = 1;
-  })
-  .finally(() => closePool());
+if (require.main === module) {
+  main()
+    .catch(error => {
+      console.error(error);
+      process.exitCode = 1;
+    })
+    .finally(() => closePool());
+}

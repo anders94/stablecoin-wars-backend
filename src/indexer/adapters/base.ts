@@ -1,4 +1,4 @@
-import { ChainType, TransferEvent, MintEvent, BurnEvent, ContractEvents } from '../../types';
+import { ChainType, TransferEvent, MintEvent, BurnEvent, ContractEvents, ContractEventsOptions } from '../../types';
 import { EventSet } from '../eventSets';
 import { RateLimitService } from '../rateLimit';
 
@@ -41,7 +41,7 @@ export interface BlockchainAdapter {
     fromBlock: number,
     toBlock: number,
     eventSet: EventSet,
-    opts?: { timestamps?: boolean }
+    opts?: ContractEventsOptions
   ): Promise<ContractEvents>;
 
   // Fee calculation

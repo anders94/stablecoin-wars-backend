@@ -298,10 +298,14 @@ from the `blocks` table and leaves `tx_fee_native` empty. It can be stopped and 
 time and runs alongside the indexer:
 
 ```bash
-npm run backfill-events -- [<contract-id>...] [--span 1000] [--parallel 4] [--rps 100]
+npm run backfill-events -- [<contract-id>...] [--span 1000] [--parallel 16] [--max-logs 15000] [--rps 200]
 ```
 
-`--span` must not exceed the node's eth_getLogs block-range limit.
+Each query's block range is sized from `blocks.tx_count` to hold about `--max-logs` events, so
+it stays under the node's eth_getLogs result cap (a node that recomputes receipts scans the
+whole range before rejecting an over-cap query). `--span` must not exceed the node's
+block-range limit. Throughput on the reference Erigon node levels off around 16 parallel
+queries.
 
 ## Database Schema
 
