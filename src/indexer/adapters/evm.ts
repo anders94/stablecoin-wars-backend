@@ -24,6 +24,10 @@ const MAX_RECEIPT_RETRIES = 5;
 const INITIAL_RETRY_DELAY_MS = 500;
 // Below this many of our transactions per block on average, fetch receipts one by one instead
 const MIN_TXS_PER_BLOCK_FOR_BLOCK_RECEIPTS = 4;
+// Block timestamp lookups in flight at once while fetching transfer events
+const TIMESTAMP_FETCH_CONCURRENCY = 8;
+// Successful full-span getLogs queries before trying a span twice as large
+const LOG_SPAN_GROW_AFTER = 20;
 
 // Helper function to sleep
 function sleep(ms: number): Promise<void> {
@@ -68,6 +72,9 @@ export class EVMAdapter implements BlockchainAdapter {
   private rateLimiter: RateLimitService | null = null;
   private endpointId: string | null = null;
   private maxRequestsPerSecond: number | null = null;
+  // Largest getLogs block span to try, learned from the node's result cap (see fetchTransferLogs)
+  private logSpan = MAX_BLOCK_RANGE;
+  private logSpanSuccesses = 0;
 
   setRateLimiter(rateLimiter: RateLimitService, endpointId: string, maxRequestsPerSecond: number): void {
     this.rateLimiter = rateLimiter;
@@ -270,35 +277,47 @@ export class EVMAdapter implements BlockchainAdapter {
     return supply.toString();
   }
 
-  // Fetch Transfer logs for a block range, bisecting on the node's result-count
-  // cap. Block-based chunking can't guarantee a query stays under the cap for a
-  // busy token, so when we hit "too many logs" we split the range in half and
-  // retry each half recursively until every sub-query fits.
-  private async queryTransferLogs(
+  // Fetch Transfer logs for a block range in pieces that stay under the node's result cap.
+  // Erigon scans the whole range before rejecting an over-cap query (several seconds for a busy
+  // token), so rather than trying the full range every time, remember the span that last fit:
+  // halve it on a cap hit, and only try doubling it after a run of successful queries.
+  private async fetchTransferLogs(
     contract: Contract,
-    start: number,
-    end: number
+    fromBlock: number,
+    toBlock: number
   ): Promise<(ethers.EventLog | ethers.Log)[]> {
-    await this.acquireRateLimitToken(`eth_getLogs (Transfer ${start}-${end})`);
     const filter = contract.filters.Transfer();
-    try {
-      return await withTimeout(
-        contract.queryFilter(filter, start, end),
-        RPC_TIMEOUT_MS,
-        `queryFilter Transfer ${start}-${end}`
-      );
-    } catch (error) {
-      if (isTooManyLogsError(error) && start < end) {
-        const mid = Math.floor((start + end) / 2);
-        StatusLineReporter.getInstance().log(
-          `  eth_getLogs cap hit for ${start}-${end}, splitting into ${start}-${mid} / ${mid + 1}-${end}`
-        );
-        const left = await this.queryTransferLogs(contract, start, mid);
-        const right = await this.queryTransferLogs(contract, mid + 1, end);
-        return [...left, ...right];
+    const logs: (ethers.EventLog | ethers.Log)[] = [];
+    let start = fromBlock;
+    while (start <= toBlock) {
+      const end = Math.min(start + this.logSpan - 1, toBlock);
+      await this.acquireRateLimitToken(`eth_getLogs (Transfer ${start}-${end})`);
+      try {
+        logs.push(...await withTimeout(
+          contract.queryFilter(filter, start, end),
+          RPC_TIMEOUT_MS,
+          `queryFilter Transfer ${start}-${end}`
+        ));
+      } catch (error) {
+        if (isTooManyLogsError(error) && start < end) {
+          this.logSpan = Math.max(1, Math.floor((end - start + 1) / 2));
+          this.logSpanSuccesses = 0;
+          StatusLineReporter.getInstance().log(
+            `  eth_getLogs cap hit for ${start}-${end}, using ${this.logSpan}-block queries`
+          );
+          continue;
+        }
+        throw error;
       }
-      throw error;
+      // Only queries that used the whole span say anything about whether a larger one would fit
+      const usedFullSpan = end - start + 1 >= this.logSpan;
+      start = end + 1;
+      if (usedFullSpan && ++this.logSpanSuccesses >= LOG_SPAN_GROW_AFTER && this.logSpan < MAX_BLOCK_RANGE) {
+        this.logSpan = Math.min(this.logSpan * 2, MAX_BLOCK_RANGE);
+        this.logSpanSuccesses = 0;
+      }
     }
+    return logs;
   }
 
   async getTransferEvents(
@@ -320,20 +339,30 @@ export class EVMAdapter implements BlockchainAdapter {
 
       const end = Math.min(start + MAX_BLOCK_RANGE - 1, toBlock);
 
-      const logs = await this.queryTransferLogs(contract, start, end);
+      const logs = await this.fetchTransferLogs(contract, start, end);
 
-      // Many logs share a block, so fetch each block's timestamp only once
+      // Many logs share a block, so fetch each block's timestamp only once, several at a time
       const timestamps = new Map<string, number>();
-      for (const log of logs) {
-        if (timestamps.has(log.blockHash)) continue;
-        await this.acquireRateLimitToken(`eth_getBlockByHash (${log.blockHash.slice(0, 10)}...)`);
-        const block = await withTimeout(
-          log.getBlock(),
-          RPC_TIMEOUT_MS,
-          `getBlock for tx ${log.transactionHash}`
-        );
-        timestamps.set(log.blockHash, block.timestamp);
-      }
+      const blockHashes = [...new Set(logs.map(log => log.blockHash))];
+      let next = 0;
+      const fetchTimestamps = async () => {
+        while (next < blockHashes.length) {
+          const blockHash = blockHashes[next++];
+          await this.acquireRateLimitToken(`eth_getBlockByHash (${blockHash.slice(0, 10)}...)`);
+          const block = await withTimeout(
+            provider.getBlock(blockHash),
+            RPC_TIMEOUT_MS,
+            `getBlock ${blockHash}`
+          );
+          if (!block) {
+            throw new Error(`Block ${blockHash} not found`);
+          }
+          timestamps.set(blockHash, block.timestamp);
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(TIMESTAMP_FETCH_CONCURRENCY, blockHashes.length) }, fetchTimestamps)
+      );
 
       for (const log of logs) {
         const parsed = contract.interface.parseLog({

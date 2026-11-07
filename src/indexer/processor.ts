@@ -192,7 +192,7 @@ export async function syncContract(contractId: string): Promise<void> {
     const currentBlock = await adapter.getCurrentBlockNumber();
     // Ensure last_synced_block is a number (PostgreSQL may return as string)
     const lastSyncedBlock = Number(syncState.last_synced_block);
-    let fromBlock = lastSyncedBlock + 1;
+    const fromBlock = lastSyncedBlock + 1;
 
     const totalBlocks = currentBlock - fromBlock + 1;
 
@@ -222,71 +222,93 @@ export async function syncContract(contractId: string): Promise<void> {
     let totalMints = 0;
     let totalBurns = 0;
 
-    while (fromBlock <= currentBlock) {
-      // Check for shutdown request
-      if (isShutdownRequested()) {
-        // No sync_state write needed: each committed chunk already recorded its progress
-        StatusLineReporter.getInstance().log(`Shutdown requested, stopping sync for ${contract.stablecoin_name} on ${contract.network_name} at block ${fromBlock}`);
-        return;
-      }
-
-      const toBlock = Math.min(fromBlock + contract.max_blocks_per_query - 1, currentBlock);
-      processedBlocks += (toBlock - fromBlock + 1);
-
+    // Start fetching a chunk from the node. Chunks are fetched one ahead, so the next chunk is
+    // downloading while the current one is written to the database.
+    const startFetch = (from: number) => {
+      const to = Math.min(from + contract.max_blocks_per_query - 1, currentBlock);
+      processedBlocks += (to - from + 1);
       const progress = ((processedBlocks / totalBlocks) * 100).toFixed(1);
+      const chunk = (async () => {
+        // Get block timestamp to show progress in time
+        const blockTimestamp = await adapter!.getBlockTimestamp(to);
+        const blockDateTime = new Date(blockTimestamp * 1000).toISOString().replace('T', ' ').substring(0, 16); // YYYY-MM-DD HH:MM format
+        StatusLineReporter.getInstance().log(`[${progress}%] Processing blocks ${from.toLocaleString()} to ${to.toLocaleString()} (${blockDateTime})...`);
+        return fetchChunk(adapter!, contract.contract_address, from, to);
+      })();
+      // Awaited below; this only stops a failure from being reported as unhandled if the loop
+      // exits before reaching it
+      chunk.catch(() => {});
+      return { fromBlock: from, toBlock: to, chunk };
+    };
 
-      // Get block timestamp to show progress in time
-      const blockTimestamp = await adapter.getBlockTimestamp(toBlock);
-      const blockDateTime = new Date(blockTimestamp * 1000).toISOString().replace('T', ' ').substring(0, 16); // YYYY-MM-DD HH:MM format
+    let pending: ReturnType<typeof startFetch> | null = null;
+    try {
+      pending = startFetch(fromBlock);
+      while (pending) {
+        const { fromBlock, toBlock } = pending;
+        const chunk = await pending.chunk;
+        pending = null;
 
-      StatusLineReporter.getInstance().log(`[${progress}%] Processing blocks ${fromBlock.toLocaleString()} to ${toBlock.toLocaleString()} (${blockDateTime})...`);
+        // Fetches cut short by a shutdown return partial data, so check after the fetch and
+        // never write a chunk once shutdown was requested.
+        // No sync_state write needed: each committed chunk already recorded its progress
+        if (isShutdownRequested()) {
+          StatusLineReporter.getInstance().log(`Shutdown requested, stopping sync for ${contract.stablecoin_name} on ${contract.network_name} at block ${fromBlock}`);
+          return;
+        }
 
-      const chunk = await fetchChunk(adapter, contract.contract_address, fromBlock, toBlock);
-      const { transfers, mints, burns } = chunk;
+        if (toBlock < currentBlock) {
+          pending = startFetch(toBlock + 1);
+        }
 
-      totalTransfers += transfers.length;
-      totalMints += mints.length;
-      totalBurns += burns.length;
+        const { transfers, mints, burns } = chunk;
+        totalTransfers += transfers.length;
+        totalMints += mints.length;
+        totalBurns += burns.length;
 
-      // Write the chunk and advance sync_state atomically. The writes are additive, so a chunk
-      // must never be applied twice: lock the sync_state row and only proceed if it still points
-      // at the block just before this chunk. If another sync loop for this contract already moved
-      // it (e.g. a timed-out job whose promise kept running), this loop stops instead.
-      // If the database goes away mid-write the transaction rolls back, so wait for it to come
-      // back and retry the write with the chunk already in memory.
-      const applied = await withDatabaseRetry(`write of blocks ${fromBlock}-${toBlock}`, () => transaction(async (client) => {
-        const state = await client.query<{ last_synced_block: string }>(
-          'SELECT last_synced_block FROM sync_state WHERE contract_id = $1 FOR UPDATE',
-          [contractId]
-        );
-        const lastSynced = Number(state.rows[0]?.last_synced_block);
-        if (lastSynced === toBlock) {
-          // Already written: the connection dropped after COMMIT reached the server but before
-          // we saw the reply, and this is the retry
+        // Write the chunk and advance sync_state atomically. The writes are additive, so a chunk
+        // must never be applied twice: lock the sync_state row and only proceed if it still points
+        // at the block just before this chunk. If another sync loop for this contract already moved
+        // it (e.g. a timed-out job whose promise kept running), this loop stops instead.
+        // If the database goes away mid-write the transaction rolls back, so wait for it to come
+        // back and retry the write with the chunk already in memory.
+        const applied = await withDatabaseRetry(`write of blocks ${fromBlock}-${toBlock}`, () => transaction(async (client) => {
+          const state = await client.query<{ last_synced_block: string }>(
+            'SELECT last_synced_block FROM sync_state WHERE contract_id = $1 FOR UPDATE',
+            [contractId]
+          );
+          const lastSynced = Number(state.rows[0]?.last_synced_block);
+          if (lastSynced === toBlock) {
+            // Already written: the connection dropped after COMMIT reached the server but before
+            // we saw the reply, and this is the retry
+            return true;
+          }
+          if (lastSynced !== fromBlock - 1) {
+            return false;
+          }
+
+          await writeChunk(client, contractId, chunk, fromBlock, toBlock);
+
+          await client.query(
+            `UPDATE sync_state
+             SET last_synced_block = $1, last_synced_at = NOW(), updated_at = NOW()
+             WHERE contract_id = $2`,
+            [toBlock, contractId]
+          );
           return true;
+        }));
+
+        if (!applied) {
+          StatusLineReporter.getInstance().log(`  sync_state for ${contract.stablecoin_name} on ${contract.network_name} moved past block ${fromBlock - 1} under another sync; stopping this one`);
+          return;
         }
-        if (lastSynced !== fromBlock - 1) {
-          return false;
-        }
-
-        await writeChunk(client, contractId, chunk, fromBlock, toBlock);
-
-        await client.query(
-          `UPDATE sync_state
-           SET last_synced_block = $1, last_synced_at = NOW(), updated_at = NOW()
-           WHERE contract_id = $2`,
-          [toBlock, contractId]
-        );
-        return true;
-      }));
-
-      if (!applied) {
-        StatusLineReporter.getInstance().log(`  sync_state for ${contract.stablecoin_name} on ${contract.network_name} moved past block ${fromBlock - 1} under another sync; stopping this one`);
-        return;
+        StatusLineReporter.getInstance().log(`  Completed processing batch`);
       }
-      StatusLineReporter.getInstance().log(`  Completed processing batch`);
-
-      fromBlock = toBlock + 1;
+    } finally {
+      // Let a prefetch that is still running finish before the adapter is disconnected
+      if (pending) {
+        await pending.chunk.catch(() => {});
+      }
     }
 
     // Get final supply
