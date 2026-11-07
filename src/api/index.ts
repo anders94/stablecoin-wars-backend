@@ -6,6 +6,9 @@ import contractsRouter from './routes/contracts';
 import metricsRouter from './routes/metrics';
 import syncRouter from './routes/sync';
 import rpcEndpointsRouter from './routes/rpcEndpoints';
+import metaRouter from './routes/meta';
+import seriesRouter from './routes/series';
+import eventsRouter from './routes/events';
 
 const app = express();
 
@@ -24,6 +27,11 @@ app.use('/api/contracts', contractsRouter);
 app.use('/api/metrics', metricsRouter);
 app.use('/api/sync', syncRouter);
 app.use('/api/rpc-endpoints', rpcEndpointsRouter);
+
+// Read-only explorer endpoints used by the frontend
+app.use('/api', metaRouter);
+app.use('/api', seriesRouter);
+app.use('/api', eventsRouter);
 
 // Error handler
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {

@@ -1,7 +1,9 @@
 import { PoolClient } from 'pg';
 import { createAdapter, BlockchainAdapter } from './adapters';
 import { transaction, withDatabaseRetry, queryOne, execute } from '../db';
-import { Contract, Network, SyncState, RESOLUTIONS, TransferEvent } from '../types';
+import { Contract, Network, SyncState, RESOLUTIONS, TransferEvent, ContractLogEvent, MintEvent, BurnEvent } from '../types';
+import { getEventSet, EventSet } from './eventSets';
+import { buildEventRows, insertEventRows, splitTransfers } from './eventRows';
 import { isShutdownRequested } from './shutdown';
 import { RateLimitService } from './rateLimit';
 import { StatusLineReporter } from './statusLineReporter';
@@ -25,6 +27,7 @@ interface ContractWithNetwork extends Contract {
   rpc_endpoint: string;
   max_requests_per_second: number;
   max_blocks_per_query: number;
+  event_set: string;
 }
 
 interface DailyMetrics {
@@ -233,7 +236,7 @@ export async function syncContract(contractId: string): Promise<void> {
         const blockTimestamp = await adapter!.getBlockTimestamp(to);
         const blockDateTime = new Date(blockTimestamp * 1000).toISOString().replace('T', ' ').substring(0, 16); // YYYY-MM-DD HH:MM format
         StatusLineReporter.getInstance().log(`[${progress}%] Processing blocks ${from.toLocaleString()} to ${to.toLocaleString()} (${blockDateTime})...`);
-        return fetchChunk(adapter!, contract.contract_address, from, to);
+        return fetchChunk(adapter!, contract.contract_address, from, to, getEventSet(contract.event_set));
       })();
       // Awaited below; this only stops a failure from being reported as unhandled if the loop
       // exits before reaching it
@@ -289,11 +292,13 @@ export async function syncContract(contractId: string): Promise<void> {
 
           await writeChunk(client, contractId, chunk, fromBlock, toBlock);
 
+          // The first chunk written with event rows marks where the event backfill must stop
           await client.query(
             `UPDATE sync_state
-             SET last_synced_block = $1, last_synced_at = NOW(), updated_at = NOW()
+             SET last_synced_block = $1, last_synced_at = NOW(), updated_at = NOW(),
+                 events_from_block = COALESCE(events_from_block, $3)
              WHERE contract_id = $2`,
-            [toBlock, contractId]
+            [toBlock, contractId, fromBlock]
           );
           return true;
         }));
@@ -351,50 +356,50 @@ export async function syncContract(contractId: string): Promise<void> {
 
 export interface ChunkData {
   transfers: TransferEvent[];
-  mints: { blockNumber: number; txHash: string; to: string; value: string; timestamp: number }[];
-  burns: { blockNumber: number; txHash: string; from: string; value: string; timestamp: number }[];
+  // Mints and burns split out of zero-address Transfers
+  mints: MintEvent[];
+  burns: BurnEvent[];
+  // The contract's other logs (administrative events, and supply events without a Transfer)
+  others: ContractLogEvent[];
   fees: Map<string, { feeNative: string; feeUsd: string | null }>;
 }
 
 /**
  * Fetch everything needed to index a block range: transfer events (split into plain
- * transfers, mints and burns) and the fee for every transaction involved.
+ * transfers, mints and burns), the event set's other logs, and the fee for every
+ * transaction involved.
  */
 export async function fetchChunk(
   adapter: BlockchainAdapter,
   contractAddress: string,
   fromBlock: number,
-  toBlock: number
+  toBlock: number,
+  eventSet: EventSet = getEventSet('erc20')
 ): Promise<ChunkData> {
-  const allTransfers = await adapter.getTransferEvents(contractAddress, fromBlock, toBlock);
-
-  // Split mints (from 0x0) and burns (to 0x0) out of the transfers rather than
-  // refetching the same range, and keep them out of transfers to avoid double counting
-  const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
-  const mints = allTransfers
-    .filter(t => t.from === ZERO_ADDRESS)
-    .map(t => ({ blockNumber: t.blockNumber, txHash: t.txHash, to: t.to, value: t.value, timestamp: t.timestamp }));
-  const burns = allTransfers
-    .filter(t => t.from !== ZERO_ADDRESS && t.to === ZERO_ADDRESS)
-    .map(t => ({ blockNumber: t.blockNumber, txHash: t.txHash, from: t.from, value: t.value, timestamp: t.timestamp }));
-  const transfers = allTransfers.filter(t =>
-    t.from !== ZERO_ADDRESS && t.to !== ZERO_ADDRESS
-  );
-
-  if (transfers.length > 0 || mints.length > 0 || burns.length > 0) {
-    StatusLineReporter.getInstance().log(`  Found ${transfers.length} transfers, ${mints.length} mints, ${burns.length} burns`);
+  let allTransfers: TransferEvent[];
+  let others: ContractLogEvent[] = [];
+  if (adapter.getContractEvents) {
+    ({ transfers: allTransfers, others } = await adapter.getContractEvents(contractAddress, fromBlock, toBlock, eventSet));
+  } else {
+    allTransfers = await adapter.getTransferEvents(contractAddress, fromBlock, toBlock);
   }
 
-  // Fetch fees once for every tx in the chunk; both metrics and block summaries use them
-  const txHashes = new Set(allTransfers.map(t => t.txHash));
-  const blockNumbers = new Set(allTransfers.map(t => t.blockNumber));
+  const { transfers, mints, burns } = splitTransfers(allTransfers);
+
+  if (transfers.length > 0 || mints.length > 0 || burns.length > 0 || others.length > 0) {
+    StatusLineReporter.getInstance().log(`  Found ${transfers.length} transfers, ${mints.length} mints, ${burns.length} burns, ${others.length} other events`);
+  }
+
+  // Fetch fees once for every tx in the chunk; metrics, block summaries and events use them
+  const txHashes = new Set([...allTransfers, ...others].map(t => t.txHash));
+  const blockNumbers = new Set([...allTransfers, ...others].map(t => t.blockNumber));
   let fees = new Map<string, { feeNative: string; feeUsd: string | null }>();
   if (txHashes.size > 0) {
     StatusLineReporter.getInstance().log(`  Getting fees for ${txHashes.size} transactions in ${blockNumbers.size} blocks...`);
     fees = await adapter.getTransactionFees(Array.from(txHashes), Array.from(blockNumbers));
   }
 
-  return { transfers, mints, burns, fees };
+  return { transfers, mints, burns, others, fees };
 }
 
 /**
@@ -409,7 +414,18 @@ export async function writeChunk(
   fromBlock: number,
   toBlock: number
 ): Promise<void> {
-  const { transfers, mints, burns, fees } = chunk;
+  const { transfers, fees } = chunk;
+
+  // Supply events without a zero-address Transfer (e.g. Tether's Issue/Redeem) count as mints/burns
+  const mints: MintEvent[] = [...chunk.mints];
+  const burns: BurnEvent[] = [...chunk.burns];
+  for (const e of chunk.others) {
+    if (e.supply === 'mint') {
+      mints.push({ blockNumber: e.blockNumber, logIndex: e.logIndex, txHash: e.txHash, to: e.to ?? '', value: e.amount ?? '0', timestamp: e.timestamp });
+    } else if (e.supply === 'burn') {
+      burns.push({ blockNumber: e.blockNumber, logIndex: e.logIndex, txHash: e.txHash, from: e.from ?? '', value: e.amount ?? '0', timestamp: e.timestamp });
+    }
+  }
 
   StatusLineReporter.getInstance().log(`  Processing events into daily metrics...`);
   await processEvents(client, contractId, transfers, mints, burns, fees);
@@ -417,6 +433,9 @@ export async function writeChunk(
   // Block summaries include blocks with no activity
   StatusLineReporter.getInstance().log(`  Processing block summaries...`);
   await processBlockSummaries(client, contractId, transfers, mints, burns, fees, fromBlock, toBlock);
+
+  // Every individual event
+  await insertEventRows(client, contractId, buildEventRows(chunk, fees));
 }
 
 async function processEvents(
@@ -582,7 +601,9 @@ async function processBlockSummaries(
   for (const mint of mints) {
     const block = getOrCreateBlock(mint.blockNumber, mint.timestamp);
     block.minted += BigInt(mint.value);
-    block.receivers.add(mint.to);
+    if (mint.to) {
+      block.receivers.add(mint.to);
+    }
     block.txCount++;
   }
 
@@ -590,7 +611,9 @@ async function processBlockSummaries(
   for (const burn of burns) {
     const block = getOrCreateBlock(burn.blockNumber, burn.timestamp);
     block.burned += BigInt(burn.value);
-    block.senders.add(burn.from);
+    if (burn.from) {
+      block.senders.add(burn.from);
+    }
     block.txCount++;
   }
 

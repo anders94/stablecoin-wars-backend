@@ -3,8 +3,8 @@
  *
  * Each day's block range is taken from its daily metrics row: from the previous day's
  * end_block + 1 through the day's own end_block. The day is re-fetched from the chain, then
- * a single transaction deletes the range's blocks (block_addresses cascade), the day's
- * metrics row and every aggregate covering it, and writes the fresh data. A day is
+ * a single transaction deletes the range's blocks (block_addresses cascade), its events, the
+ * day's metrics row and every aggregate covering it, and writes the fresh data. A day is
  * therefore either fully rebuilt or left untouched, so the script is safe to re-run.
  * sync_state is never touched, so this can run alongside the main indexer.
  *
@@ -21,6 +21,7 @@ import { query, queryOne, transaction, closePool } from '../db';
 import { RESOLUTIONS } from '../types';
 import { RateLimitService } from './rateLimit';
 import { fetchChunk, writeChunk, ChunkData } from './processor';
+import { getEventSet } from './eventSets';
 
 interface ContractConfig {
   id: string;
@@ -30,6 +31,7 @@ interface ContractConfig {
   rpc_endpoint: string;
   max_requests_per_second: number;
   max_blocks_per_query: number;
+  event_set: string;
 }
 
 interface DayRange {
@@ -85,6 +87,13 @@ async function replaceDay(client: PoolClient, contractId: string, range: DayRang
     'DELETE FROM blocks WHERE contract_id = $1 AND block_number BETWEEN $2 AND $3',
     [contractId, range.fromBlock, range.toBlock]
   );
+  // Every event in the range is inside the day (checked when fetching), so the day bounds the
+  // partitions to search
+  await client.query(
+    `DELETE FROM events WHERE contract_id = $1 AND block_number BETWEEN $2 AND $3
+       AND timestamp >= $4::date AND timestamp < $4::date + 1`,
+    [contractId, range.fromBlock, range.toBlock, range.day]
+  );
   await client.query(
     'DELETE FROM metrics WHERE contract_id = $1 AND resolution_seconds = $2 AND period_start = $3::date',
     [contractId, RESOLUTIONS.DAY, range.day]
@@ -118,7 +127,7 @@ async function main() {
   days.sort();
 
   const contract = await queryOne<ContractConfig>(
-    `SELECT c.id, c.contract_address, n.chain_type,
+    `SELECT c.id, c.contract_address, c.event_set, n.chain_type,
             re.id as rpc_endpoint_id, re.url as rpc_endpoint, re.max_requests_per_second, re.max_blocks_per_query
      FROM contracts c
      JOIN networks n ON c.network_id = n.id
@@ -163,9 +172,9 @@ async function main() {
       const chunks: [number, number, ChunkData][] = [];
       for (let from = range.fromBlock; from <= range.toBlock; from += contract.max_blocks_per_query) {
         const to = Math.min(from + contract.max_blocks_per_query - 1, range.toBlock);
-        const chunk = await fetchChunk(adapter, contract.contract_address, from, to);
+        const chunk = await fetchChunk(adapter, contract.contract_address, from, to, getEventSet(contract.event_set));
         // Every event in the range must belong to this day, or neighbouring days would be changed too
-        const stray = [...chunk.transfers, ...chunk.mints, ...chunk.burns]
+        const stray = [...chunk.transfers, ...chunk.mints, ...chunk.burns, ...chunk.others]
           .find(e => e.timestamp < dayStart || e.timestamp >= dayStart + SECONDS_PER_DAY);
         if (stray) {
           throw new Error(`Block ${stray.blockNumber} in ${range.day}'s range has timestamp ${stray.timestamp} outside the day`);

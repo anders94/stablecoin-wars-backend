@@ -155,6 +155,33 @@ GET /api/metrics/:ticker
 GET /api/metrics/:ticker/range  # Get available date range
 ```
 
+### Explorer (read-only, used by the frontend)
+
+All take optional `coins` (tickers) and `networks` (names), comma-separated. Times are ISO 8601,
+amounts in whole tokens unless noted.
+
+```
+GET /api/meta                         # coins, networks, contracts, sync + event coverage, data range
+GET /api/series?from&to&bucket&group_by
+    bucket: auto | hour | day | week | month | quarter | year (hour: ranges up to 31 days)
+    group_by: coin | network | contract | total
+    -> per bucket: minted, burned, net, volume, transfers, fees, supply, daily senders/receivers
+GET /api/overview?from&to             # range totals per coin / network / overall, plus previous period
+GET /api/events?from&to&kinds&categories&exclude_categories&names&address&min_amount&max_amount&block&sort&limit&cursor
+    kinds: transfer,mint,burn,admin   sort: time_desc | time_asc | amount_desc
+    keyset pagination: pass next_cursor back as cursor
+GET /api/events/summary?from&to       # counts of non-transfer events by kind / category / name
+GET /api/events/:contractId/:block/:logIndex   # one event + its transaction + block aggregates
+GET /api/tx/:hash
+GET /api/blocks/:network/:number
+GET /api/addresses/:address?from&to   # totals, daily in/out, counterparties, admin events naming it
+GET /api/flows/top?from&to&by=sender|receiver|pair   # ranges up to 31 days
+```
+
+Supply is computed as the running total of minted - burned since creation (it matches the
+on-chain `totalSupply`). The API listens on `HOST` (default `127.0.0.1`) because it also exposes
+write endpoints; put only the read-only routes above behind a public proxy.
+
 ### Sync Status
 
 ```
@@ -254,6 +281,27 @@ Auto-resolution selection:
 - Date range 30-300 days → 10-day
 - Date range 300-3000 days → 100-day
 - Date range > 3000 days → 1000-day
+
+## Individual events
+
+The indexer stores every Transfer (split into transfer / mint / burn) and the contract's
+administrative events in the `events` table, partitioned by month. Which administrative events
+are decoded is set per contract by `contracts.event_set` (see `src/indexer/eventSets.ts`):
+`fiattoken` for USDC/EURC, `tether` for Ethereum USDT (whose Issue/Redeem/DestroyedBlackFunds
+change supply without a zero-address Transfer and are counted as mints/burns), `erc20` for
+Transfers only.
+
+The live sync records the first block it stored events for in `sync_state.events_from_block`.
+History before that is filled by the event backfill, which walks backwards to the creation
+block (so recent history is available first), reads only logs from the node, takes timestamps
+from the `blocks` table and leaves `tx_fee_native` empty. It can be stopped and resumed at any
+time and runs alongside the indexer:
+
+```bash
+npm run backfill-events -- [<contract-id>...] [--span 1000] [--parallel 4] [--rps 100]
+```
+
+`--span` must not exceed the node's eth_getLogs block-range limit.
 
 ## Database Schema
 

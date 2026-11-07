@@ -11,7 +11,8 @@
     "migrate:create": "db-migrate create",
     "indexer": "ts-node src/indexer/worker.ts",
     "backfill-fees": "ts-node src/indexer/backfill-fees.ts",
-    "fix-sync-state": "node scripts/fix-sync-state.js"
+    "fix-sync-state": "node scripts/fix-sync-state.js",
+    "backfill-events": "ts-node src/indexer/backfill-events.ts"
   },
   "keywords": [
     "stablecoin",

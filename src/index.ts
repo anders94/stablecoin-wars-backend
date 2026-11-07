@@ -4,10 +4,12 @@ dotenv.config();
 import app from './api';
 import { closePool } from './db';
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+// Only listen locally by default: the API includes write endpoints (contracts, sync resets)
+const HOST = process.env.HOST || '127.0.0.1';
 
-const server = app.listen(PORT, () => {
-  console.log(`Stablecoin Wars API running on port ${PORT}`);
+const server = app.listen(PORT, HOST, () => {
+  console.log(`Stablecoin Wars API running on ${HOST}:${PORT}`);
 });
 
 // Graceful shutdown

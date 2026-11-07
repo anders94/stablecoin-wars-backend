@@ -121,6 +121,8 @@ export type Resolution = typeof RESOLUTIONS[keyof typeof RESOLUTIONS];
 // Blockchain event types
 export interface TransferEvent {
   blockNumber: number;
+  // Position of the log in its block; adapters that cannot provide it leave it unset
+  logIndex?: number;
   txHash: string;
   from: string;
   to: string;
@@ -130,6 +132,7 @@ export interface TransferEvent {
 
 export interface MintEvent {
   blockNumber: number;
+  logIndex?: number;
   txHash: string;
   to: string;
   value: string;
@@ -138,10 +141,33 @@ export interface MintEvent {
 
 export interface BurnEvent {
   blockNumber: number;
+  logIndex?: number;
   txHash: string;
   from: string;
   value: string;
   timestamp: number;
+}
+
+// A decoded non-Transfer log from a contract's event set (administrative events, and supply
+// events such as Tether's Issue/Redeem)
+export interface ContractLogEvent {
+  blockNumber: number;
+  logIndex: number;
+  txHash: string;
+  timestamp: number;
+  eventName: string;
+  category: string;
+  // Set when the event changes supply without a zero-address Transfer
+  supply?: 'mint' | 'burn';
+  from: string | null;
+  to: string | null;
+  amount: string | null;
+  args: Record<string, string>;
+}
+
+export interface ContractEvents {
+  transfers: TransferEvent[];
+  others: ContractLogEvent[];
 }
 
 // API request/response types

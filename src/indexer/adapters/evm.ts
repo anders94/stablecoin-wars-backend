@@ -1,6 +1,7 @@
 import { ethers, Contract, Provider, JsonRpcProvider, toQuantity } from 'ethers';
 import { BlockchainAdapter, registerAdapter } from './base';
-import { ChainType, TransferEvent, MintEvent, BurnEvent } from '../../types';
+import { ChainType, TransferEvent, MintEvent, BurnEvent, ContractEvents, ContractLogEvent } from '../../types';
+import { EventSet, EventDefinition, getEventSet } from '../eventSets';
 import { isShutdownRequested } from '../shutdown';
 import { RateLimitService } from '../rateLimit';
 import { StatusLineReporter } from '../statusLineReporter';
@@ -12,6 +13,69 @@ const ERC20_ABI = [
   'function totalSupply() view returns (uint256)',
   'function balanceOf(address) view returns (uint256)',
 ];
+
+const TRANSFER_IFACE = new ethers.Interface([ERC20_ABI[0]]);
+const TRANSFER_TOPIC = TRANSFER_IFACE.getEvent('Transfer')!.topicHash;
+
+// Interface and topic0 -> definition for each event set, built once
+const eventSetInterfaces = new Map<string, { iface: ethers.Interface; definitions: Map<string, EventDefinition> }>();
+
+function getEventSetInterface(eventSet: EventSet) {
+  let entry = eventSetInterfaces.get(eventSet.name);
+  if (!entry) {
+    const iface = new ethers.Interface(eventSet.events.map(e => e.abi));
+    const definitions = new Map<string, EventDefinition>();
+    for (const definition of eventSet.events) {
+      const fragment = ethers.EventFragment.from(definition.abi.replace(/^event /, ''));
+      definitions.set(fragment.topicHash, definition);
+    }
+    entry = { iface, definitions };
+    eventSetInterfaces.set(eventSet.name, entry);
+  }
+  return entry;
+}
+
+function argValue(value: unknown): string {
+  return typeof value === 'string' ? value.toLowerCase() : String(value);
+}
+
+/**
+ * Decode one of an event set's logs. A log whose layout does not match the ABI (e.g. an older
+ * implementation indexed an argument differently) is kept with its raw topics and data.
+ */
+function decodeContractLog(
+  iface: ethers.Interface,
+  definition: EventDefinition,
+  log: ethers.Log,
+  timestamp: number
+): ContractLogEvent {
+  const eventName = ethers.EventFragment.from(definition.abi.replace(/^event /, '')).name;
+  let args: Record<string, string> | null = null;
+  try {
+    const parsed = iface.parseLog({ topics: log.topics as string[], data: log.data });
+    if (parsed) {
+      args = {};
+      parsed.fragment.inputs.forEach((input, i) => {
+        args![input.name || `arg${i}`] = argValue(parsed.args[i]);
+      });
+    }
+  } catch {
+    args = null;
+  }
+  return {
+    blockNumber: log.blockNumber,
+    logIndex: log.index,
+    txHash: log.transactionHash,
+    timestamp,
+    eventName,
+    category: definition.category,
+    supply: definition.supply,
+    from: args && definition.fromArg ? args[definition.fromArg] ?? null : null,
+    to: args && definition.toArg ? args[definition.toArg] ?? null : null,
+    amount: args && definition.amountArg ? args[definition.amountArg] ?? null : null,
+    args: args ?? { raw_topics: log.topics.join(','), raw_data: log.data },
+  };
+}
 
 // Zero address for detecting mints/burns
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -277,26 +341,28 @@ export class EVMAdapter implements BlockchainAdapter {
     return supply.toString();
   }
 
-  // Fetch Transfer logs for a block range in pieces that stay under the node's result cap.
+  // Fetch logs for a block range in pieces that stay under the node's result cap.
   // Erigon scans the whole range before rejecting an over-cap query (several seconds for a busy
   // token), so rather than trying the full range every time, remember the span that last fit:
   // halve it on a cap hit, and only try doubling it after a run of successful queries.
-  private async fetchTransferLogs(
-    contract: Contract,
+  private async fetchLogs(
+    address: string,
+    topic0s: string[],
     fromBlock: number,
-    toBlock: number
-  ): Promise<(ethers.EventLog | ethers.Log)[]> {
-    const filter = contract.filters.Transfer();
-    const logs: (ethers.EventLog | ethers.Log)[] = [];
+    toBlock: number,
+    label: string
+  ): Promise<ethers.Log[]> {
+    const provider = this.getProvider();
+    const logs: ethers.Log[] = [];
     let start = fromBlock;
     while (start <= toBlock) {
       const end = Math.min(start + this.logSpan - 1, toBlock);
-      await this.acquireRateLimitToken(`eth_getLogs (Transfer ${start}-${end})`);
+      await this.acquireRateLimitToken(`eth_getLogs (${label} ${start}-${end})`);
       try {
         logs.push(...await withTimeout(
-          contract.queryFilter(filter, start, end),
+          provider.getLogs({ address, topics: [topic0s], fromBlock: start, toBlock: end }),
           RPC_TIMEOUT_MS,
-          `queryFilter Transfer ${start}-${end}`
+          `getLogs ${label} ${start}-${end}`
         ));
       } catch (error) {
         if (isTooManyLogsError(error) && start < end) {
@@ -320,70 +386,108 @@ export class EVMAdapter implements BlockchainAdapter {
     return logs;
   }
 
+  // Timestamps of the blocks the logs are in. Many logs share a block, so each block is
+  // fetched only once, several at a time.
+  private async fetchLogTimestamps(logs: ethers.Log[]): Promise<Map<string, number>> {
+    const provider = this.getProvider();
+    const timestamps = new Map<string, number>();
+    const blockHashes = [...new Set(logs.map(log => log.blockHash))];
+    let next = 0;
+    const fetchTimestamps = async () => {
+      while (next < blockHashes.length) {
+        const blockHash = blockHashes[next++];
+        await this.acquireRateLimitToken(`eth_getBlockByHash (${blockHash.slice(0, 10)}...)`);
+        const block = await withTimeout(
+          provider.getBlock(blockHash),
+          RPC_TIMEOUT_MS,
+          `getBlock ${blockHash}`
+        );
+        if (!block) {
+          throw new Error(`Block ${blockHash} not found`);
+        }
+        timestamps.set(blockHash, block.timestamp);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(TIMESTAMP_FETCH_CONCURRENCY, blockHashes.length) }, fetchTimestamps)
+    );
+    return timestamps;
+  }
+
   async getTransferEvents(
     address: string,
     fromBlock: number,
     toBlock: number
   ): Promise<TransferEvent[]> {
-    const provider = this.getProvider();
-    const contract = new Contract(address, ERC20_ABI, provider);
-    const events: TransferEvent[] = [];
+    const { transfers } = await this.getContractEvents(address, fromBlock, toBlock, getEventSet('erc20'));
+    return transfers;
+  }
+
+  /**
+   * Fetch Transfer logs together with the event set's other logs in one getLogs query per span.
+   * Transfer addresses are checksummed (as stored in block_addresses); decoded arguments of
+   * other events are lowercased. Without timestamps (opts.timestamps === false) every event's
+   * timestamp is 0 and the caller fills it in.
+   */
+  async getContractEvents(
+    address: string,
+    fromBlock: number,
+    toBlock: number,
+    eventSet: EventSet,
+    opts: { timestamps?: boolean } = {}
+  ): Promise<ContractEvents> {
+    const { iface, definitions } = getEventSetInterface(eventSet);
+    const topic0s = [TRANSFER_TOPIC, ...definitions.keys()];
+    const transfers: TransferEvent[] = [];
+    const others: ContractLogEvent[] = [];
 
     // Process in chunks to avoid RPC limits
     for (let start = fromBlock; start <= toBlock; start += MAX_BLOCK_RANGE) {
       // Check for shutdown request
       if (isShutdownRequested()) {
-        console.log('  Shutdown requested, stopping transfer event fetch');
+        console.log('  Shutdown requested, stopping event fetch');
         break;
       }
 
       const end = Math.min(start + MAX_BLOCK_RANGE - 1, toBlock);
-
-      const logs = await this.fetchTransferLogs(contract, start, end);
-
-      // Many logs share a block, so fetch each block's timestamp only once, several at a time
-      const timestamps = new Map<string, number>();
-      const blockHashes = [...new Set(logs.map(log => log.blockHash))];
-      let next = 0;
-      const fetchTimestamps = async () => {
-        while (next < blockHashes.length) {
-          const blockHash = blockHashes[next++];
-          await this.acquireRateLimitToken(`eth_getBlockByHash (${blockHash.slice(0, 10)}...)`);
-          const block = await withTimeout(
-            provider.getBlock(blockHash),
-            RPC_TIMEOUT_MS,
-            `getBlock ${blockHash}`
-          );
-          if (!block) {
-            throw new Error(`Block ${blockHash} not found`);
-          }
-          timestamps.set(blockHash, block.timestamp);
-        }
-      };
-      await Promise.all(
-        Array.from({ length: Math.min(TIMESTAMP_FETCH_CONCURRENCY, blockHashes.length) }, fetchTimestamps)
-      );
+      const logs = await this.fetchLogs(address, topic0s, start, end, eventSet.name === 'erc20' ? 'Transfer' : 'events');
+      const timestamps = opts.timestamps === false ? null : await this.fetchLogTimestamps(logs);
 
       for (const log of logs) {
-        const parsed = contract.interface.parseLog({
-          topics: log.topics as string[],
-          data: log.data,
-        });
-
-        if (parsed) {
-          events.push({
-            blockNumber: log.blockNumber,
-            txHash: log.transactionHash,
-            from: parsed.args[0],
-            to: parsed.args[1],
-            value: parsed.args[2].toString(),
-            timestamp: timestamps.get(log.blockHash)!,
-          });
+        const timestamp = timestamps ? timestamps.get(log.blockHash)! : 0;
+        const topic0 = log.topics[0];
+        if (topic0 === TRANSFER_TOPIC) {
+          // Some tokens' logs share the Transfer signature with different indexing; skip what
+          // does not decode as a standard Transfer
+          let parsed: ethers.LogDescription | null = null;
+          try {
+            parsed = TRANSFER_IFACE.parseLog({ topics: log.topics as string[], data: log.data });
+          } catch {
+            parsed = null;
+          }
+          if (parsed) {
+            transfers.push({
+              blockNumber: log.blockNumber,
+              logIndex: log.index,
+              txHash: log.transactionHash,
+              from: parsed.args[0] as string,
+              to: parsed.args[1] as string,
+              value: parsed.args[2].toString(),
+              timestamp,
+            });
+          }
+          continue;
         }
+
+        const definition = definitions.get(topic0);
+        if (!definition) {
+          continue;
+        }
+        others.push(decodeContractLog(iface, definition, log, timestamp));
       }
     }
 
-    return events;
+    return { transfers, others };
   }
 
   async getMintBurnEvents(

@@ -1,4 +1,5 @@
-import { ChainType, TransferEvent, MintEvent, BurnEvent } from '../../types';
+import { ChainType, TransferEvent, MintEvent, BurnEvent, ContractEvents } from '../../types';
+import { EventSet } from '../eventSets';
 import { RateLimitService } from '../rateLimit';
 
 export interface BlockchainAdapter {
@@ -32,6 +33,16 @@ export interface BlockchainAdapter {
     fromBlock: number,
     toBlock: number
   ): Promise<{ mints: MintEvent[]; burns: BurnEvent[] }>;
+
+  // Transfers plus the event set's other logs in one pass, with log indexes. Optional: adapters
+  // without it only index Transfers. With opts.timestamps === false, timestamps are left 0.
+  getContractEvents?(
+    address: string,
+    fromBlock: number,
+    toBlock: number,
+    eventSet: EventSet,
+    opts?: { timestamps?: boolean }
+  ): Promise<ContractEvents>;
 
   // Fee calculation
   getTransactionFee(txHash: string): Promise<{

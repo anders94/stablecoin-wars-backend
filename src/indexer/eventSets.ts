@@ -1,0 +1,79 @@
+/**
+ * Event sets: which logs to index for a contract beyond the standard ERC-20 Transfer, and how
+ * to classify them. A contract picks its set with contracts.event_set.
+ *
+ * Each event is a human-readable ABI fragment (indexed flags matter for decoding) plus:
+ *  - category: administrative grouping shown in the UI
+ *  - supply:   set when the event changes total supply WITHOUT a matching Transfer from/to the
+ *              zero address (e.g. Tether's Issue/Redeem). Such events are counted as mints or
+ *              burns in metrics and stored with kind 'mint'/'burn'. Events that merely accompany
+ *              a zero-address Transfer (e.g. FiatToken's Mint/Burn) must NOT set this, or supply
+ *              would be counted twice.
+ *  - amountArg / fromArg / toArg: which decoded arguments fill events.amount/from/to
+ */
+export type EventCategory = 'freeze' | 'minter' | 'role' | 'pause' | 'upgrade' | 'issuance' | 'config';
+
+export interface EventDefinition {
+  abi: string;
+  category: EventCategory;
+  supply?: 'mint' | 'burn';
+  amountArg?: string;
+  fromArg?: string;
+  toArg?: string;
+}
+
+export interface EventSet {
+  name: string;
+  events: EventDefinition[];
+}
+
+const ERC20: EventSet = { name: 'erc20', events: [] };
+
+// Circle's FiatToken (USDC, EURC) behind a ZeppelinOS AdminUpgradeabilityProxy
+const FIATTOKEN: EventSet = {
+  name: 'fiattoken',
+  events: [
+    { abi: 'event Mint(address indexed minter, address indexed to, uint256 amount)', category: 'issuance', amountArg: 'amount', fromArg: 'minter', toArg: 'to' },
+    { abi: 'event Burn(address indexed burner, uint256 amount)', category: 'issuance', amountArg: 'amount', fromArg: 'burner' },
+    { abi: 'event MinterConfigured(address indexed minter, uint256 minterAllowedAmount)', category: 'minter', amountArg: 'minterAllowedAmount', toArg: 'minter' },
+    { abi: 'event MinterRemoved(address indexed oldMinter)', category: 'minter', toArg: 'oldMinter' },
+    { abi: 'event MasterMinterChanged(address indexed newMasterMinter)', category: 'role', toArg: 'newMasterMinter' },
+    { abi: 'event Blacklisted(address indexed _account)', category: 'freeze', toArg: '_account' },
+    { abi: 'event UnBlacklisted(address indexed _account)', category: 'freeze', toArg: '_account' },
+    { abi: 'event BlacklisterChanged(address indexed newBlacklister)', category: 'role', toArg: 'newBlacklister' },
+    { abi: 'event Pause()', category: 'pause' },
+    { abi: 'event Unpause()', category: 'pause' },
+    { abi: 'event PauserChanged(address indexed newAddress)', category: 'role', toArg: 'newAddress' },
+    { abi: 'event OwnershipTransferred(address previousOwner, address newOwner)', category: 'role', fromArg: 'previousOwner', toArg: 'newOwner' },
+    { abi: 'event RescuerChanged(address indexed newRescuer)', category: 'role', toArg: 'newRescuer' },
+    { abi: 'event Upgraded(address implementation)', category: 'upgrade', toArg: 'implementation' },
+    { abi: 'event AdminChanged(address previousAdmin, address newAdmin)', category: 'role', fromArg: 'previousAdmin', toArg: 'newAdmin' },
+  ],
+};
+
+// Tether's TetherToken (USDT on Ethereum). Issue/Redeem/DestroyedBlackFunds change supply
+// without emitting a zero-address Transfer.
+const TETHER: EventSet = {
+  name: 'tether',
+  events: [
+    { abi: 'event Issue(uint256 amount)', category: 'issuance', supply: 'mint', amountArg: 'amount' },
+    { abi: 'event Redeem(uint256 amount)', category: 'issuance', supply: 'burn', amountArg: 'amount' },
+    { abi: 'event DestroyedBlackFunds(address _blackListedUser, uint256 _balance)', category: 'freeze', supply: 'burn', amountArg: '_balance', fromArg: '_blackListedUser' },
+    { abi: 'event AddedBlackList(address _user)', category: 'freeze', toArg: '_user' },
+    { abi: 'event RemovedBlackList(address _user)', category: 'freeze', toArg: '_user' },
+    { abi: 'event Deprecate(address newAddress)', category: 'upgrade', toArg: 'newAddress' },
+    { abi: 'event Params(uint256 feeBasisPoints, uint256 maxFee)', category: 'config' },
+    { abi: 'event Pause()', category: 'pause' },
+    { abi: 'event Unpause()', category: 'pause' },
+  ],
+};
+
+const EVENT_SETS = new Map<string, EventSet>([ERC20, FIATTOKEN, TETHER].map(s => [s.name, s]));
+
+export function getEventSet(name: string | null | undefined): EventSet {
+  const set = EVENT_SETS.get(name || 'erc20');
+  if (!set) {
+    throw new Error(`Unknown event set: ${name}`);
+  }
+  return set;
+}
