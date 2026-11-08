@@ -120,10 +120,20 @@ export class StatusLineReporter {
     this.callsInLastSecond++;
   }
 
+  private quiet = false;
+
+  /** Drop log() messages (scripts that report their own progress, like the backfills). */
+  public setQuiet(quiet: boolean): void {
+    this.quiet = quiet;
+  }
+
   /**
    * Log a message that should scroll normally above the status line
    */
   public log(message: string): void {
+    if (this.quiet) {
+      return;
+    }
     if (this.isTTY && this.isRunning) {
       // Clear the status line, print the message, then redraw the status line
       logUpdate.clear();

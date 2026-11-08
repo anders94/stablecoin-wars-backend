@@ -43,6 +43,113 @@ interface DailyMetrics {
   endBlock: number;
 }
 
+type FeeMap = Map<string, { feeNative: string; feeUsd: string | null }>;
+
+/**
+ * Sum each transaction's fee once into the bucket its events fall in (a transaction is in a single
+ * block, so in a single block and day). Transactions that only emitted administrative events are
+ * not counted.
+ */
+function addDistinctTxFees<T>(
+  events: { txHash: string }[],
+  fees: FeeMap,
+  bucketOf: (e: { txHash: string }) => T,
+  add: (bucket: T, fee: bigint) => void
+): void {
+  const seen = new Set<string>();
+  for (const e of events) {
+    if (seen.has(e.txHash)) continue;
+    seen.add(e.txHash);
+    const fee = fees.get(e.txHash);
+    if (fee) add(bucketOf(e), BigInt(fee.feeNative));
+  }
+}
+
+/** How writeChunk keeps the daily unique sender/receiver counts. */
+export type UniquesMode =
+  // Live sync: add the chunk's own distinct counts, and recount the touched days exactly from the
+  // events table at most every UNIQUES_REFRESH_MS (and once more when a day has closed)
+  | 'live'
+  // Recount every touched day exactly now (reindexing whole days)
+  | 'exact'
+  // Only add the chunk's counts; the caller recounts afterwards (history backfill)
+  | 'deferred';
+
+const UNIQUES_REFRESH_MS = 10 * 60 * 1000;
+// contract id -> day (YYYY-MM-DD) -> when it was last recounted
+const uniquesRecountedAt = new Map<string, Map<string, number>>();
+// contract id -> latest day seen by the live sync
+const latestLiveDay = new Map<string, string>();
+
+/**
+ * Recount a day's unique senders and receivers exactly from the events table: senders are the
+ * sources of transfers and burns, receivers the destinations of transfers and mints.
+ */
+export async function recountDailyUniques(client: PoolClient, contractId: string, day: string): Promise<void> {
+  await client.query(
+    `UPDATE metrics m
+     SET unique_senders = u.senders, unique_receivers = u.receivers, updated_at = NOW()
+     FROM (
+       SELECT (COUNT(DISTINCT from_address) FILTER (WHERE kind IN ('transfer', 'burn')))::int AS senders,
+              (COUNT(DISTINCT to_address) FILTER (WHERE kind IN ('transfer', 'mint')))::int AS receivers
+       FROM events
+       WHERE contract_id = $1 AND timestamp >= $2::date AND timestamp < $2::date + 1 AND kind <> 'admin'
+     ) u
+     WHERE m.contract_id = $1 AND m.period_start = $2::date AND m.resolution_seconds = $3`,
+    [contractId, day, RESOLUTIONS.DAY]
+  );
+}
+
+async function refreshDailyUniques(client: PoolClient, contractId: string, days: string[], mode: UniquesMode): Promise<void> {
+  if (mode === 'deferred' || days.length === 0) return;
+  const toRecount = new Set<string>();
+  const now = Date.now();
+  let recounted = uniquesRecountedAt.get(contractId);
+  if (!recounted) {
+    recounted = new Map();
+    uniquesRecountedAt.set(contractId, recounted);
+  }
+  if (mode === 'exact') {
+    days.forEach(d => toRecount.add(d));
+  } else {
+    for (const d of days) {
+      if (now - (recounted.get(d) ?? 0) >= UNIQUES_REFRESH_MS) toRecount.add(d);
+    }
+    // Days run in order on the live sync, so a newer day means the previous one has closed:
+    // give it a final exact count
+    const newest = days.reduce((a, b) => (a > b ? a : b));
+    const previous = latestLiveDay.get(contractId);
+    if (previous && previous < newest) toRecount.add(previous);
+    if (!previous || previous < newest) latestLiveDay.set(contractId, newest);
+    // Only the newest day and the one before it can still be touched by the live sync
+    const keepFrom = previous && previous < newest ? previous : newest;
+    for (const d of [...recounted.keys()]) {
+      if (d < keepFrom) recounted.delete(d);
+    }
+  }
+  for (const d of toRecount) {
+    await recountDailyUniques(client, contractId, d);
+    recounted.set(d, now);
+  }
+}
+
+/**
+ * Fill in the account of supply events that implicitly credit or debit the contract owner (Tether's
+ * Issue mints to, and Redeem burns from, whoever owns the contract at that block).
+ */
+export async function resolveSupplyAccounts(adapter: BlockchainAdapter, contractAddress: string, others: ContractLogEvent[]): Promise<void> {
+  const unresolved = others.filter(e => (e.supply === 'mint' && !e.to) || (e.supply === 'burn' && !e.from));
+  if (unresolved.length === 0 || !adapter.getOwnerAt) return;
+  const owners = new Map<number, string | null>();
+  for (const e of unresolved) {
+    if (!owners.has(e.blockNumber)) {
+      owners.set(e.blockNumber, await adapter.getOwnerAt(contractAddress, e.blockNumber));
+    }
+    const owner = owners.get(e.blockNumber) ?? null;
+    if (e.supply === 'mint') e.to = owner; else e.from = owner;
+  }
+}
+
 interface BlockData {
   blockNumber: number;
   timestamp: number;
@@ -378,6 +485,7 @@ export async function fetchChunk(
   let others: ContractLogEvent[] = [];
   if (adapter.getContractEvents) {
     ({ transfers: allTransfers, others } = await adapter.getContractEvents(contractAddress, fromBlock, toBlock, eventSet));
+    await resolveSupplyAccounts(adapter, contractAddress, others);
   } else {
     allTransfers = await adapter.getTransferEvents(contractAddress, fromBlock, toBlock);
   }
@@ -405,13 +513,15 @@ export async function fetchChunk(
  * replaced and events are deduplicated, but the daily metrics are additive (a day spans many
  * chunks), so the caller must make sure a range is never applied twice (run inside a
  * transaction that also records the range as done, or that first deletes the range's rows).
+ * Daily unique sender/receiver counts are kept according to `uniques` (see UniquesMode).
  */
 export async function writeChunk(
   client: PoolClient,
   contractId: string,
   chunk: ChunkData,
   fromBlock: number,
-  toBlock: number
+  toBlock: number,
+  uniques: UniquesMode = 'live'
 ): Promise<void> {
   const { transfers, fees } = chunk;
 
@@ -434,7 +544,12 @@ export async function writeChunk(
   await processBlockSummaries(client, contractId, transfers, mints, burns, fees, fromBlock, toBlock);
 
   // Every individual event
-  await insertEventRows(client, contractId, buildEventRows(chunk, fees));
+  const rows = buildEventRows(chunk, fees);
+  await insertEventRows(client, contractId, rows);
+
+  // Exact daily unique counts come from the events just stored
+  const days = [...new Set(rows.filter(r => r.kind !== 'admin').map(r => new Date(r.timestamp * 1000).toISOString().slice(0, 10)))];
+  await refreshDailyUniques(client, contractId, days, uniques);
 }
 
 async function processEvents(
@@ -503,14 +618,15 @@ async function processEvents(
     daily.burned += BigInt(burn.value);
   }
 
-  // Add transaction fees
-  for (const transfer of transfers) {
-    const fee = fees.get(transfer.txHash);
-    if (fee) {
-      const daily = getOrCreateDaily(transfer.timestamp, transfer.blockNumber);
-      daily.totalFeesNative += BigInt(fee.feeNative);
-    }
-  }
+  // Transaction fees, once per transaction
+  const byTx = new Map<string, { timestamp: number; blockNumber: number }>();
+  for (const e of [...transfers, ...mints, ...burns]) byTx.set(e.txHash, e);
+  addDistinctTxFees(
+    [...byTx.keys()].map(txHash => ({ txHash })),
+    fees,
+    e => byTx.get(e.txHash)!,
+    (e, fee) => { getOrCreateDaily(e.timestamp, e.blockNumber).totalFeesNative += fee; }
+  );
 
   // Upsert daily metrics to database
   for (const [_key, daily] of dailyMetrics) {
@@ -556,7 +672,7 @@ async function processBlockSummaries(
   transfers: TransferEvent[],
   mints: { blockNumber: number; txHash: string; to: string; value: string; timestamp: number }[],
   burns: { blockNumber: number; txHash: string; from: string; value: string; timestamp: number }[],
-  fees: Map<string, { feeNative: string; feeUsd: string | null }>,
+  fees: FeeMap,
   fromBlock: number,
   toBlock: number
 ): Promise<void> {
@@ -606,70 +722,48 @@ async function processBlockSummaries(
     block.txCount++;
   }
 
-  // Add fees for all transactions (transfers, mints, burns)
-  for (const transfer of transfers) {
-    const fee = fees.get(transfer.txHash);
-    if (fee) {
-      const block = getOrCreateBlock(transfer.blockNumber, transfer.timestamp);
-      block.totalFeesNative += BigInt(fee.feeNative);
-    }
-  }
+  // Transaction fees, once per transaction
+  const blockOfTx = new Map<string, { blockNumber: number; timestamp: number }>();
+  for (const e of [...transfers, ...mints, ...burns]) blockOfTx.set(e.txHash, e);
+  addDistinctTxFees(
+    [...blockOfTx.keys()].map(txHash => ({ txHash })),
+    fees,
+    e => blockOfTx.get(e.txHash)!,
+    (e, fee) => { getOrCreateBlock(e.blockNumber, e.timestamp).totalFeesNative += fee; }
+  );
 
-  for (const mint of mints) {
-    const fee = fees.get(mint.txHash);
-    if (fee) {
-      const block = getOrCreateBlock(mint.blockNumber, mint.timestamp);
-      block.totalFeesNative += BigInt(fee.feeNative);
-    }
-  }
-
-  for (const burn of burns) {
-    const fee = fees.get(burn.txHash);
-    if (fee) {
-      const block = getOrCreateBlock(burn.blockNumber, burn.timestamp);
-      block.totalFeesNative += BigInt(fee.feeNative);
-    }
-  }
-
-  // Upsert blocks to database
-  // Note: Blocks with events have accurate timestamps from the events
-  // Blocks without events use the approximate timestamp from the batch end block
-  let blockIndex = 0;
-  const totalBlocks = blocks.size;
-  for (const [_blockNumber, block] of blocks) {
-    blockIndex++;
-    if (blockIndex % 50 === 0) {
-      StatusLineReporter.getInstance().log(`      Writing block ${blockIndex}/${totalBlocks} to database...`);
-    }
-    // Insert or replace the block. A chunk always holds every event of each of its blocks, so
-    // the fresh values are complete; replacing (not adding) keeps a re-processed range from
-    // double-counting. Per-address detail lives in the events table.
-    await client.query(
-      `INSERT INTO blocks (
-        contract_id, block_number, timestamp,
-        minted, burned, tx_count, total_transferred, total_fees_native, total_supply
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      ON CONFLICT (contract_id, block_number)
-      DO UPDATE SET
-        timestamp = COALESCE(EXCLUDED.timestamp, blocks.timestamp),
-        minted = EXCLUDED.minted,
-        burned = EXCLUDED.burned,
-        tx_count = EXCLUDED.tx_count,
-        total_transferred = EXCLUDED.total_transferred,
-        total_fees_native = EXCLUDED.total_fees_native,
-        total_supply = COALESCE(EXCLUDED.total_supply, blocks.total_supply),
-        updated_at = NOW()`,
-      [
-        contractId,
-        block.blockNumber,
-        block.timestamp > 0 ? new Date(block.timestamp * 1000) : null,
-        block.minted.toString(),
-        block.burned.toString(),
-        block.txCount,
-        block.totalTransferred.toString(),
-        block.totalFeesNative.toString(),
-        block.totalSupply,
-      ]
-    );
-  }
+  // Insert or replace every block in one statement. A chunk always holds every event of each of
+  // its blocks, so the fresh values are complete; replacing (not adding) keeps a re-processed
+  // range from double-counting. Blocks without events get a NULL timestamp, keeping any known one.
+  // Per-address detail lives in the events table.
+  const rows = [...blocks.values()];
+  await client.query(
+    `INSERT INTO blocks (
+       contract_id, block_number, timestamp,
+       minted, burned, tx_count, total_transferred, total_fees_native, total_supply
+     )
+     SELECT $1, bn, CASE WHEN ts > 0 THEN to_timestamp(ts) AT TIME ZONE 'UTC' END,
+            minted::numeric, burned::numeric, n, moved::numeric, fees::numeric, NULL
+     FROM unnest($2::bigint[], $3::double precision[], $4::text[], $5::text[], $6::integer[], $7::text[], $8::text[])
+       AS u(bn, ts, minted, burned, n, moved, fees)
+     ON CONFLICT (contract_id, block_number)
+     DO UPDATE SET
+       timestamp = COALESCE(EXCLUDED.timestamp, blocks.timestamp),
+       minted = EXCLUDED.minted,
+       burned = EXCLUDED.burned,
+       tx_count = EXCLUDED.tx_count,
+       total_transferred = EXCLUDED.total_transferred,
+       total_fees_native = EXCLUDED.total_fees_native,
+       updated_at = NOW()`,
+    [
+      contractId,
+      rows.map(b => b.blockNumber),
+      rows.map(b => b.timestamp),
+      rows.map(b => b.minted.toString()),
+      rows.map(b => b.burned.toString()),
+      rows.map(b => b.txCount),
+      rows.map(b => b.totalTransferred.toString()),
+      rows.map(b => b.totalFeesNative.toString()),
+    ]
+  );
 }

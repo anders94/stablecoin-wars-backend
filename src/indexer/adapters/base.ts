@@ -44,6 +44,13 @@ export interface BlockchainAdapter {
     opts?: ContractEventsOptions
   ): Promise<ContractEvents>;
 
+  // The contract's owner() at a block (for supply events that implicitly credit the owner, such
+  // as Tether's Issue and Redeem). Optional; null when the contract has no owner().
+  getOwnerAt?(address: string, blockNumber: number): Promise<string | null>;
+
+  // Every transaction fee in a block, keyed by lowercased tx hash. Optional.
+  getBlockFees?(blockNumber: number): Promise<Map<string, { feeNative: string; feeUsd: string | null }>>;
+
   // Fee calculation
   getTransactionFee(txHash: string): Promise<{
     feeNative: string;

@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { query } from '../../db';
 import { RESOLUTIONS } from '../../types';
-import { loadContracts, eventCoverageFrom, explorerFor, nativeCurrency, isoTs } from '../helpers';
+import { loadAllContracts, eventCoverageFrom, explorerFor, nativeCurrency, isoTs } from '../helpers';
 
 const router = Router();
 
@@ -12,7 +12,10 @@ const router = Router();
  */
 router.get('/meta', (req: Request, res: Response, next: NextFunction) => {
   (async () => {
-    const contracts = await loadContracts();
+    // Coins, networks and the data range come from listed contracts only; the contract list also
+    // has unlisted ones (marked), for the status page
+    const contracts = await loadAllContracts();
+    const listed = contracts.filter(c => c.listed);
     const range = await query<{ contract_id: string; earliest: Date; latest: Date }>(
       `SELECT contract_id, min(period_start) AS earliest, max(period_start) AS latest
        FROM metrics WHERE resolution_seconds = $1 GROUP BY contract_id`,
@@ -29,7 +32,7 @@ router.get('/meta', (req: Request, res: Response, next: NextFunction) => {
 
     const coins = new Map<string, { ticker: string; name: string; company: string | null; decimals: number }>();
     const networks = new Map<string, { name: string; display_name: string; chain_type: string; fee_unit: string; explorer: ReturnType<typeof explorerFor> }>();
-    for (const c of contracts) {
+    for (const c of listed) {
       coins.set(c.ticker, { ticker: c.ticker, name: c.coin_name, company: c.company, decimals: c.decimals });
       networks.set(c.network, {
         name: c.network, display_name: c.network_display, chain_type: c.chain_type,
@@ -44,6 +47,7 @@ router.get('/meta', (req: Request, res: Response, next: NextFunction) => {
       address: c.address,
       decimals: c.decimals,
       is_active: c.is_active,
+      listed: c.listed,
       creation_block: c.creation_block,
       creation_date: isoTs(c.creation_date),
       sync: {
@@ -62,10 +66,17 @@ router.get('/meta', (req: Request, res: Response, next: NextFunction) => {
         live_from_block: c.events_from_block,
         backfill_status: c.backfill_status ?? (c.events_from_block !== null && c.creation_block !== null && c.events_from_block <= c.creation_block ? 'complete' : null),
       },
+      fees: {
+        // Transaction fees are recorded from this block / time on (null: since creation)
+        from_block: c.fee_low_block,
+        from_time: isoTs(c.fee_from_time),
+        backfill_status: c.fee_backfill_status,
+      },
     }));
 
-    const earliest = contractRows.map(c => c.metrics.earliest_day).filter((d): d is string => !!d).sort()[0] ?? null;
-    const latest = contractRows.map(c => c.sync.latest_block_time).filter((d): d is string => !!d).sort().pop() ?? null;
+    const listedRows = contractRows.filter(c => c.listed);
+    const earliest = listedRows.map(c => c.metrics.earliest_day).filter((d): d is string => !!d).sort()[0] ?? null;
+    const latest = listedRows.map(c => c.sync.latest_block_time).filter((d): d is string => !!d).sort().pop() ?? null;
 
     res.json({
       coins: [...coins.values()],

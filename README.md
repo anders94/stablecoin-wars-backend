@@ -307,6 +307,45 @@ whole range before rejecting an over-cap query). `--span` must not exceed the no
 block-range limit. Throughput on the reference Erigon node levels off around 16 parallel
 queries.
 
+Daily unique senders (sources of transfers and burns) and receivers (destinations of transfers
+and mints) are counted exactly from the `events` table: the live sync recounts the days it
+touches every few minutes and once more when a day closes. To recount history:
+
+```bash
+npx ts-node src/indexer/recompute-daily-uniques.ts <contract-id>... [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+```
+
+Network fees are summed once per transaction that moved the token (not once per event).
+
+## Adding a coin with its full history
+
+Replaying a coin's history through the live sync (one chunk and one fee lookup at a time) would
+take weeks, so a new coin is registered at the chain head and its history loaded in bulk:
+
+```bash
+# 1. Register (presets in src/indexer/register-contract.ts, e.g. usdt-ethereum). The contract is
+#    unlisted, so the explorer API ignores it while its history loads. Restart the indexer.
+npx ts-node src/indexer/register-contract.ts usdt-ethereum
+
+# 2. Once the live sync has written its first chunk: load events, block summaries and daily
+#    metrics from the creation block up to where the live sync began (~1 day for USDT)
+npm run backfill-events -- <contract-id> --full
+
+# 3. Check the supply against the chain, then list it
+#    UPDATE contracts SET listed = true WHERE id = '<contract-id>';
+
+# 4. Historical network fees from block receipts (~5 days for USDT), while the site is live
+npx ts-node src/indexer/backfill-receipt-fees.ts <contract-id> [--parallel 16] [--rps 200]
+```
+
+`--full` sizes each eth_getLogs range from the log density of recently fetched ranges (there are
+no block summaries to plan from), takes timestamps from the logs (`blockTimestamp`), and fetches
+every log the contract emitted so it can report topics outside the event set. Supply created
+without an event (Tether's constructor mints 100,000 USDT silently) is stored in
+`contracts.initial_supply`, and supply series start from it. Supply events that credit the owner
+implicitly (Tether's Issue/Redeem) are attributed to `owner()` at that block. The Status page
+shows each contract's event and fee coverage.
+
 ## Database Schema
 
 ### Core Tables

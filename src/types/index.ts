@@ -172,11 +172,16 @@ export interface ContractEventsOptions {
   exactRange?: boolean;
   // Return Transfer addresses lowercased instead of checksummed (cheaper)
   lowercaseAddresses?: boolean;
+  // Fetch every log the contract emitted, not just the event set's, and count the topic0s of
+  // the ones that are neither Transfers nor in the event set (ContractEvents.unknownTopics)
+  allTopics?: boolean;
 }
 
 export interface ContractEvents {
   transfers: TransferEvent[];
   others: ContractLogEvent[];
+  // With opts.allTopics: topic0 -> number of logs not in the event set
+  unknownTopics?: Map<string, number>;
 }
 
 // API request/response types

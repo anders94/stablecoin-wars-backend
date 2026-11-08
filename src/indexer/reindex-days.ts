@@ -20,7 +20,7 @@ import { createAdapter } from './adapters';
 import { query, queryOne, transaction, closePool } from '../db';
 import { RESOLUTIONS } from '../types';
 import { RateLimitService } from './rateLimit';
-import { fetchChunk, writeChunk, ChunkData } from './processor';
+import { fetchChunk, writeChunk, ChunkData, recountDailyUniques } from './processor';
 import { getEventSet } from './eventSets';
 
 interface ContractConfig {
@@ -103,8 +103,9 @@ async function replaceDay(client: PoolClient, contractId: string, range: DayRang
     [contractId, RESOLUTIONS.DAY, range.day]
   );
   for (const [from, to, chunk] of chunks) {
-    await writeChunk(client, contractId, chunk, from, to);
+    await writeChunk(client, contractId, chunk, from, to, 'deferred');
   }
+  await recountDailyUniques(client, contractId, range.day);
   // The rebuilt range must reproduce the day's row with the same end block, or the range was wrong
   const rebuilt = await client.query<{ end_block: string }>(
     'SELECT end_block FROM metrics WHERE contract_id = $1 AND resolution_seconds = $2 AND period_start = $3::date',

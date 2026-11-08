@@ -23,6 +23,14 @@ export interface ContractInfo {
   events_from_block: number | null;
   backfill_low_block: number | null;
   backfill_status: string | null;
+  // Kept out of the public explorer while its history loads
+  listed: boolean;
+  // Supply created without an event (base units)
+  initial_supply: string;
+  // Lowest block from which transaction fees are recorded, and when that block was (null: from creation)
+  fee_low_block: number | null;
+  fee_from_time: Date | null;
+  fee_backfill_status: string | null;
 }
 
 // Block explorers and native fee currencies by network name
@@ -62,7 +70,13 @@ export function nativeCurrency(network: string, chainType: string) {
 let contractsCache: { at: number; contracts: ContractInfo[] } | null = null;
 const CONTRACTS_CACHE_MS = 15000;
 
+/** The contracts the public explorer shows (listed ones). */
 export async function loadContracts(): Promise<ContractInfo[]> {
+  return (await loadAllContracts()).filter(c => c.listed);
+}
+
+/** Every contract, including unlisted ones whose history is still loading (for the status page). */
+export async function loadAllContracts(): Promise<ContractInfo[]> {
   if (contractsCache && Date.now() - contractsCache.at < CONTRACTS_CACHE_MS) {
     return contractsCache.contracts;
   }
@@ -73,13 +87,21 @@ export async function loadContracts(): Promise<ContractInfo[]> {
             c.is_active, c.event_set,
             ss.last_synced_block::float8 AS last_synced_block, ss.last_synced_at, ss.status AS sync_status,
             ss.events_from_block::float8 AS events_from_block,
-            eb.low_block::float8 AS backfill_low_block, eb.status AS backfill_status
+            eb.low_block::float8 AS backfill_low_block, eb.status AS backfill_status,
+            c.listed, c.initial_supply::text AS initial_supply,
+            CASE WHEN fb.status = 'complete' THEN NULL ELSE fb.low_block::float8 END AS fee_low_block,
+            CASE WHEN fb.status = 'complete' THEN NULL ELSE
+              (SELECT b.timestamp FROM blocks b
+               WHERE b.contract_id = c.id AND b.block_number >= fb.low_block AND b.timestamp IS NOT NULL
+               ORDER BY b.block_number LIMIT 1) END AS fee_from_time,
+            fb.status AS fee_backfill_status
      FROM contracts c
      JOIN stablecoins s ON c.stablecoin_id = s.id
      LEFT JOIN companies co ON s.company_id = co.id
      JOIN networks n ON c.network_id = n.id
      LEFT JOIN sync_state ss ON ss.contract_id = c.id
      LEFT JOIN event_backfill_state eb ON eb.contract_id = c.id
+     LEFT JOIN fee_backfill_state fb ON fb.contract_id = c.id
      ORDER BY s.ticker, n.name`
   );
   contractsCache = { at: Date.now(), contracts: rows };

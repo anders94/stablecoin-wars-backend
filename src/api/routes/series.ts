@@ -69,7 +69,8 @@ async function loadDaily(contracts: ContractInfo[]): Promise<Map<string, DailyRo
     for (const c of missing) {
       result.set(c.id, []);
     }
-    const running = new Map<string, bigint>();
+    // Supply starts from what the contract created without an event
+    const running = new Map<string, bigint>(missing.map(c => [c.id, big(c.initial_supply)]));
     for (const r of rows) {
       const minted = big(r.minted);
       const burned = big(r.burned);
@@ -87,15 +88,20 @@ async function loadDaily(contracts: ContractInfo[]): Promise<Map<string, DailyRo
   return result;
 }
 
-/** Supply through the end of the last day before `t` (ms). */
-function supplyBefore(rows: DailyRow[], t: number): bigint {
+/**
+ * Supply through the end of the last day before `t` (ms): the contract's initial supply from its
+ * creation until its first day with activity, nothing before it existed.
+ */
+function supplyBefore(c: ContractInfo, rows: DailyRow[], t: number): bigint {
   let lo = 0;
   let hi = rows.length;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
     if (rows[mid].day < t) lo = mid + 1; else hi = mid;
   }
-  return lo === 0 ? 0n : rows[lo - 1].supply;
+  if (lo > 0) return rows[lo - 1].supply;
+  const created = c.creation_date ? new Date(c.creation_date).getTime() : null;
+  return created !== null && t > created ? big(c.initial_supply) : 0n;
 }
 
 function bucketStart(t: number, bucket: Bucket): number {
@@ -240,7 +246,7 @@ router.get('/series', wrap(async (req, res) => {
       const hours = (byContract.get(c.id) ?? []).sort((a, b) => a.h - b.h);
       // Supply at the start of the range's first day, then hour by hour (including hours of
       // that day before `from`, which only move the running supply)
-      let supply = supplyBefore(daily.get(c.id) ?? [], Math.floor(fromMs / DAY_MS) * DAY_MS);
+      let supply = supplyBefore(c, daily.get(c.id) ?? [], Math.floor(fromMs / DAY_MS) * DAY_MS);
       const perHour = new Map(hours.map(h => [Number(h.h), h]));
       for (let t = Math.floor(fromMs / DAY_MS) * DAY_MS; t < toMs; t += HOUR_MS) {
         const h = perHour.get(t);
@@ -283,7 +289,7 @@ router.get('/series', wrap(async (req, res) => {
           acc.senders += r.senders;
           acc.receivers += r.receivers;
         }
-        acc.supply += toUnits(supplyBefore(rows, end), c.decimals)!;
+        acc.supply += toUnits(supplyBefore(c, rows, end), c.decimals)!;
         group.buckets.set(start, acc);
       }
     }
@@ -345,8 +351,8 @@ function summarize(contracts: ContractInfo[], daily: Map<string, DailyRow[]>, fr
   const days = Math.max(1, (toDay - fromDay) / DAY_MS);
   for (const c of contracts) {
     const rows = daily.get(c.id) ?? [];
-    totals.supply_start += toUnits(supplyBefore(rows, fromDay), c.decimals)!;
-    totals.supply_end += toUnits(supplyBefore(rows, toDay), c.decimals)!;
+    totals.supply_start += toUnits(supplyBefore(c, rows, fromDay), c.decimals)!;
+    totals.supply_end += toUnits(supplyBefore(c, rows, toDay), c.decimals)!;
     const fee = nativeCurrency(c.network, c.chain_type);
     for (const r of rows) {
       if (r.day < fromDay || r.day >= toDay) continue;
@@ -393,10 +399,18 @@ router.get('/overview', wrap(async (req, res) => {
     }]));
   };
 
+  // Fees are complete from the latest point any selected contract has them from
+  const feeFrom = contracts
+    .map(c => (c.fee_low_block !== null ? (c.fee_from_time ? new Date(c.fee_from_time).getTime() : Date.now()) : null))
+    .filter((t): t is number => t !== null)
+    .reduce<number | null>((a, b) => (a === null || b > a ? b : a), null);
+
   res.json({
     from: new Date(fromDay).toISOString(),
     to: new Date(toDay).toISOString(),
     previous_from: new Date(prevFromDay).toISOString(),
+    // Network fees before this time are incomplete (null: complete for the whole range)
+    fees_complete_from: feeFrom !== null && feeFrom > fromDay ? new Date(feeFrom).toISOString() : null,
     total: {
       current: summarize(contracts, daily, fromDay, toDay),
       previous: summarize(contracts, daily, prevFromDay, fromDay),

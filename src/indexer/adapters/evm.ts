@@ -77,8 +77,9 @@ function decodeContractLog(
   };
 }
 
-// The parts of a log the adapter uses, from either ethers' getLogs or raw JSON-RPC
-type RawLog = Pick<ethers.Log, 'blockNumber' | 'blockHash' | 'index' | 'transactionHash' | 'topics' | 'data'>;
+// The parts of a log the adapter uses, from either ethers' getLogs or raw JSON-RPC. Raw logs
+// carry the block timestamp when the node returns it (Erigon and recent geth do).
+type RawLog = Pick<ethers.Log, 'blockNumber' | 'blockHash' | 'index' | 'transactionHash' | 'topics' | 'data'> & { timestamp?: number };
 
 // Zero address for detecting mints/burns
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -95,6 +96,34 @@ const MIN_TXS_PER_BLOCK_FOR_BLOCK_RECEIPTS = 4;
 const TIMESTAMP_FETCH_CONCURRENCY = 8;
 // Successful full-span getLogs queries before trying a span twice as large
 const LOG_SPAN_GROW_AFTER = 20;
+// owner() selector, for contracts whose supply events implicitly credit the owner
+const OWNER_SELECTOR = '0x8da5cb5b';
+
+type FeeMap = Map<string, { feeNative: string; feeUsd: string | null }>;
+
+// Block receipts fetched recently, shared by every adapter instance in the process: the live
+// sync fetches the same blocks for each contract on a chain, one contract after another
+const RECEIPT_CACHE_MAX_BLOCKS = 4000;
+const RECEIPT_CACHE_TTL_MS = 30 * 60 * 1000;
+const receiptCache = new Map<string, { fees: FeeMap; at: number }>();
+
+function cachedBlockFees(key: string): FeeMap | null {
+  const hit = receiptCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > RECEIPT_CACHE_TTL_MS) {
+    receiptCache.delete(key);
+    return null;
+  }
+  return hit.fees;
+}
+
+function cacheBlockFees(key: string, fees: FeeMap): void {
+  receiptCache.set(key, { fees, at: Date.now() });
+  // Maps iterate in insertion order, so the first keys are the oldest
+  while (receiptCache.size > RECEIPT_CACHE_MAX_BLOCKS) {
+    receiptCache.delete(receiptCache.keys().next().value!);
+  }
+}
 
 // Helper function to sleep
 function sleep(ms: number): Promise<void> {
@@ -346,6 +375,24 @@ export class EVMAdapter implements BlockchainAdapter {
     return supply.toString();
   }
 
+  async getOwnerAt(address: string, blockNumber: number): Promise<string | null> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.acquireRateLimitToken(`eth_call (owner ${address} @${blockNumber})`);
+        const result = await withTimeout(
+          this.getProvider().send('eth_call', [{ to: address, data: OWNER_SELECTOR }, toQuantity(blockNumber)]) as Promise<string>,
+          RPC_TIMEOUT_MS,
+          `owner ${address} @${blockNumber}`
+        );
+        // An address is the low 20 bytes of the 32-byte word; anything else means no owner()
+        return result && result.length === 66 ? '0x' + result.slice(26).toLowerCase() : null;
+      } catch (error) {
+        if (attempt >= MAX_RECEIPT_RETRIES - 1 || isShutdownRequested()) throw error;
+        await sleep(INITIAL_RETRY_DELAY_MS * 2 ** attempt);
+      }
+    }
+  }
+
   // Fetch logs for a block range in pieces that stay under the node's result cap.
   // Erigon scans the whole range before rejecting an over-cap query (several seconds for a busy
   // token), so rather than trying the full range every time, remember the span that last fit:
@@ -396,7 +443,7 @@ export class EVMAdapter implements BlockchainAdapter {
   // that size their own ranges (the event backfill) are not affected by each other.
   private async fetchLogsBisecting(
     address: string,
-    topic0s: string[],
+    topic0s: string[] | null,
     fromBlock: number,
     toBlock: number,
     label: string
@@ -405,11 +452,15 @@ export class EVMAdapter implements BlockchainAdapter {
     try {
       // Raw JSON-RPC: ethers' getLogs builds a formatted Log object per log (checksummed
       // addresses etc.), which for 15k logs blocks the event loop for over a second
+      // A null topic list fetches every log the contract emitted
+      const filter = topic0s
+        ? { address, topics: [topic0s], fromBlock: toQuantity(fromBlock), toBlock: toQuantity(toBlock) }
+        : { address, fromBlock: toQuantity(fromBlock), toBlock: toQuantity(toBlock) };
       const raw = await withTimeout(
-        this.getProvider().send('eth_getLogs', [{ address, topics: [topic0s], fromBlock: toQuantity(fromBlock), toBlock: toQuantity(toBlock) }]),
+        this.getProvider().send('eth_getLogs', [filter]),
         LONG_RPC_TIMEOUT_MS,
         `getLogs ${label} ${fromBlock}-${toBlock}`
-      ) as { blockNumber: string; blockHash: string; logIndex: string; transactionHash: string; topics: string[]; data: string; removed?: boolean }[];
+      ) as { blockNumber: string; blockHash: string; logIndex: string; transactionHash: string; topics: string[]; data: string; removed?: boolean; blockTimestamp?: string }[];
       return raw.filter(l => !l.removed).map(l => ({
         blockNumber: parseInt(l.blockNumber, 16),
         blockHash: l.blockHash,
@@ -417,6 +468,7 @@ export class EVMAdapter implements BlockchainAdapter {
         transactionHash: l.transactionHash,
         topics: l.topics,
         data: l.data,
+        timestamp: l.blockTimestamp ? parseInt(l.blockTimestamp, 16) : undefined,
       }));
     } catch (error) {
       if (!isTooManyLogsError(error) || fromBlock >= toBlock) {
@@ -484,6 +536,10 @@ export class EVMAdapter implements BlockchainAdapter {
     const topic0s = [TRANSFER_TOPIC, ...definitions.keys()];
     const transfers: TransferEvent[] = [];
     const others: ContractLogEvent[] = [];
+    const unknownTopics = opts.allTopics ? new Map<string, number>() : undefined;
+    if (opts.allTopics && !opts.exactRange) {
+      throw new Error('allTopics requires exactRange');
+    }
 
     // Process in chunks to avoid RPC limits
     for (let start = fromBlock; start <= toBlock; start += MAX_BLOCK_RANGE) {
@@ -496,12 +552,14 @@ export class EVMAdapter implements BlockchainAdapter {
       const end = opts.exactRange ? toBlock : Math.min(start + MAX_BLOCK_RANGE - 1, toBlock);
       const label = eventSet.name === 'erc20' ? 'Transfer' : 'events';
       const logs = opts.exactRange
-        ? await this.fetchLogsBisecting(address, topic0s, start, end, label)
+        ? await this.fetchLogsBisecting(address, opts.allTopics ? null : topic0s, start, end, label)
         : await this.fetchLogs(address, topic0s, start, end, label);
-      const timestamps = opts.timestamps === false ? null : await this.fetchLogTimestamps(logs);
+      // Timestamps the node returned with the logs are used as they are; blocks only for the rest
+      const untimed = logs.filter(log => log.timestamp === undefined);
+      const timestamps = opts.timestamps === false || untimed.length === 0 ? null : await this.fetchLogTimestamps(untimed);
 
       for (const log of logs) {
-        const timestamp = timestamps ? timestamps.get(log.blockHash)! : 0;
+        const timestamp = log.timestamp ?? (timestamps ? timestamps.get(log.blockHash)! : 0);
         const topic0 = log.topics[0];
         if (topic0 === TRANSFER_TOPIC) {
           // Decoded by hand: ethers' parseLog costs ~65us per log, which blocks the event loop
@@ -525,13 +583,17 @@ export class EVMAdapter implements BlockchainAdapter {
 
         const definition = definitions.get(topic0);
         if (!definition) {
+          if (unknownTopics) {
+            const key = topic0 ?? '(anonymous)';
+            unknownTopics.set(key, (unknownTopics.get(key) ?? 0) + 1);
+          }
           continue;
         }
         others.push(decodeContractLog(iface, definition, log, timestamp));
       }
     }
 
-    return { transfers, others };
+    return { transfers, others, unknownTopics };
   }
 
   async getMintBurnEvents(
@@ -630,7 +692,16 @@ export class EVMAdapter implements BlockchainAdapter {
    * Fees for every transaction in a block, from a single eth_getBlockReceipts call.
    * Retries with backoff like getTransactionFee and throws once retries are exhausted.
    */
-  private async getBlockReceiptFees(blockNumber: number): Promise<Map<string, { feeNative: string; feeUsd: string | null }>> {
+  async getBlockFees(blockNumber: number): Promise<FeeMap> {
+    return this.getBlockReceiptFees(blockNumber);
+  }
+
+  private async getBlockReceiptFees(blockNumber: number): Promise<FeeMap> {
+    const cacheKey = `${this.rpcEndpoint}|${blockNumber}`;
+    const cached = cachedBlockFees(cacheKey);
+    if (cached) {
+      return cached;
+    }
     const provider = this.getProvider();
     let lastError: Error | null = null;
 
@@ -658,6 +729,7 @@ export class EVMAdapter implements BlockchainAdapter {
           const fee = BigInt(receipt.gasUsed) * BigInt(receipt.effectiveGasPrice);
           fees.set(receipt.transactionHash.toLowerCase(), { feeNative: fee.toString(), feeUsd: null });
         }
+        cacheBlockFees(cacheKey, fees);
         return fees;
       } catch (error) {
         lastError = error as Error;

@@ -303,10 +303,13 @@ async function txEvents(txHash: string, timestamp?: Date): Promise<EventDbRow[]>
     params.push(dbTs(timestamp));
     tsCond = 'AND timestamp = $2';
   }
-  return query<EventDbRow>(
+  const rows = await query<EventDbRow>(
     `SELECT ${EVENT_COLUMNS} FROM events WHERE tx_hash = $1 ${tsCond} ORDER BY block_number, log_index LIMIT 5000`,
     params
   );
+  // Only the explorer's (listed) contracts
+  const listed = await contractMap();
+  return rows.filter(r => listed.has(r.contract_id));
 }
 
 async function blockAggregates(c: ContractInfo, blockNumber: number) {
