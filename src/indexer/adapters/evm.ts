@@ -354,11 +354,12 @@ export class EVMAdapter implements BlockchainAdapter {
     const contract = new Contract(address, ERC20_ABI, this.getProvider());
     try {
       await this.acquireRateLimitToken(`eth_call (decimals ${address})`);
-      return await withTimeout(
+      // ethers returns uint8 results as bigint
+      return Number(await withTimeout(
         contract.decimals(),
         RPC_TIMEOUT_MS,
         `getTokenDecimals ${address}`
-      );
+      ));
     } catch {
       return 18; // Default to 18 decimals
     }
