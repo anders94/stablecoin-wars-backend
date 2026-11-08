@@ -401,9 +401,10 @@ export async function fetchChunk(
 }
 
 /**
- * Add a fetched chunk to the daily metrics and block summaries. The writes are additive,
- * so the caller must make sure a range is never applied twice (run inside a transaction
- * that also records the range as done, or that first deletes the range's existing rows).
+ * Add a fetched chunk to the daily metrics, block summaries and events. Block summaries are
+ * replaced and events are deduplicated, but the daily metrics are additive (a day spans many
+ * chunks), so the caller must make sure a range is never applied twice (run inside a
+ * transaction that also records the range as done, or that first deletes the range's rows).
  */
 export async function writeChunk(
   client: PoolClient,
@@ -640,7 +641,9 @@ async function processBlockSummaries(
     if (blockIndex % 50 === 0) {
       StatusLineReporter.getInstance().log(`      Writing block ${blockIndex}/${totalBlocks} to database...`);
     }
-    // Insert or update block. Per-address detail lives in the events table.
+    // Insert or replace the block. A chunk always holds every event of each of its blocks, so
+    // the fresh values are complete; replacing (not adding) keeps a re-processed range from
+    // double-counting. Per-address detail lives in the events table.
     await client.query(
       `INSERT INTO blocks (
         contract_id, block_number, timestamp,
@@ -648,11 +651,13 @@ async function processBlockSummaries(
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       ON CONFLICT (contract_id, block_number)
       DO UPDATE SET
-        minted = blocks.minted + EXCLUDED.minted,
-        burned = blocks.burned + EXCLUDED.burned,
-        tx_count = blocks.tx_count + EXCLUDED.tx_count,
-        total_transferred = blocks.total_transferred + EXCLUDED.total_transferred,
-        total_fees_native = blocks.total_fees_native + EXCLUDED.total_fees_native,
+        timestamp = COALESCE(EXCLUDED.timestamp, blocks.timestamp),
+        minted = EXCLUDED.minted,
+        burned = EXCLUDED.burned,
+        tx_count = EXCLUDED.tx_count,
+        total_transferred = EXCLUDED.total_transferred,
+        total_fees_native = EXCLUDED.total_fees_native,
+        total_supply = COALESCE(EXCLUDED.total_supply, blocks.total_supply),
         updated_at = NOW()`,
       [
         contractId,
