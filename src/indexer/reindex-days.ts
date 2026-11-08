@@ -3,7 +3,7 @@
  *
  * Each day's block range is taken from its daily metrics row: from the previous day's
  * end_block + 1 through the day's own end_block. The day is re-fetched from the chain, then
- * a single transaction deletes the range's blocks (block_addresses cascade), its events, the
+ * a single transaction deletes the range's blocks, its events, the
  * day's metrics row and every aggregate covering it, and writes the fresh data. A day is
  * therefore either fully rebuilt or left untouched, so the script is safe to re-run.
  * sync_state is never touched, so this can run alongside the main indexer.

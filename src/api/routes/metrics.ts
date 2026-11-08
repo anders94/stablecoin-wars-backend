@@ -233,7 +233,9 @@ router.get('/:ticker/custom', async (req: Request, res: Response) => {
       params
     );
 
-    // Query unique addresses per period
+    // Query unique addresses per period from the individual events: senders are the sources of
+    // transfers and burns, receivers the destinations of transfers and mints
+    const addressGrouping = periodGrouping.replace(/b\.timestamp/g, 'e.timestamp');
     const addressData = await query<{
       period_start: Date;
       network_name: string;
@@ -241,18 +243,18 @@ router.get('/:ticker/custom', async (req: Request, res: Response) => {
       unique_receivers: number;
     }>(
       `SELECT
-         ${periodGrouping} as period_start,
+         ${addressGrouping} as period_start,
          n.name as network_name,
-         COUNT(DISTINCT CASE WHEN ba.address_type IN ('sender', 'both') THEN ba.address END) as unique_senders,
-         COUNT(DISTINCT CASE WHEN ba.address_type IN ('receiver', 'both') THEN ba.address END) as unique_receivers
-       FROM blocks b
-       JOIN contracts ct ON b.contract_id = ct.id
+         (COUNT(DISTINCT e.from_address) FILTER (WHERE e.kind IN ('transfer', 'burn')))::int as unique_senders,
+         (COUNT(DISTINCT e.to_address) FILTER (WHERE e.kind IN ('transfer', 'mint')))::int as unique_receivers
+       FROM events e
+       JOIN contracts ct ON e.contract_id = ct.id
        JOIN stablecoins s ON ct.stablecoin_id = s.id
        JOIN networks n ON ct.network_id = n.id
-       LEFT JOIN block_addresses ba ON b.id = ba.block_id
        WHERE UPPER(s.ticker) = $1
-         AND b.timestamp >= $2
-         AND b.timestamp < $3
+         AND e.timestamp >= $2
+         AND e.timestamp < $3
+         AND e.kind <> 'admin'
          ${networkFilter}
        GROUP BY period_start, n.name
        ORDER BY period_start, n.name`,

@@ -49,8 +49,6 @@ interface BlockData {
   minted: bigint;
   burned: bigint;
   txCount: number;
-  senders: Set<string>;
-  receivers: Set<string>;
   totalTransferred: bigint;
   totalFeesNative: bigint;
   totalSupply: string | null;
@@ -573,8 +571,6 @@ async function processBlockSummaries(
       minted: BigInt(0),
       burned: BigInt(0),
       txCount: 0,
-      senders: new Set(),
-      receivers: new Set(),
       totalTransferred: BigInt(0),
       totalFeesNative: BigInt(0),
       totalSupply: null,
@@ -592,8 +588,6 @@ async function processBlockSummaries(
   for (const transfer of transfers) {
     const block = getOrCreateBlock(transfer.blockNumber, transfer.timestamp);
     block.txCount++;
-    block.senders.add(transfer.from);
-    block.receivers.add(transfer.to);
     block.totalTransferred += BigInt(transfer.value);
   }
 
@@ -601,9 +595,6 @@ async function processBlockSummaries(
   for (const mint of mints) {
     const block = getOrCreateBlock(mint.blockNumber, mint.timestamp);
     block.minted += BigInt(mint.value);
-    if (mint.to) {
-      block.receivers.add(mint.to);
-    }
     block.txCount++;
   }
 
@@ -611,9 +602,6 @@ async function processBlockSummaries(
   for (const burn of burns) {
     const block = getOrCreateBlock(burn.blockNumber, burn.timestamp);
     block.burned += BigInt(burn.value);
-    if (burn.from) {
-      block.senders.add(burn.from);
-    }
     block.txCount++;
   }
 
@@ -652,8 +640,8 @@ async function processBlockSummaries(
     if (blockIndex % 50 === 0) {
       StatusLineReporter.getInstance().log(`      Writing block ${blockIndex}/${totalBlocks} to database...`);
     }
-    // Insert or update block
-    const result = (await client.query<{ id: string }>(
+    // Insert or update block. Per-address detail lives in the events table.
+    await client.query(
       `INSERT INTO blocks (
         contract_id, block_number, timestamp,
         minted, burned, tx_count, total_transferred, total_fees_native, total_supply
@@ -665,8 +653,7 @@ async function processBlockSummaries(
         tx_count = blocks.tx_count + EXCLUDED.tx_count,
         total_transferred = blocks.total_transferred + EXCLUDED.total_transferred,
         total_fees_native = blocks.total_fees_native + EXCLUDED.total_fees_native,
-        updated_at = NOW()
-      RETURNING id`,
+        updated_at = NOW()`,
       [
         contractId,
         block.blockNumber,
@@ -678,38 +665,6 @@ async function processBlockSummaries(
         block.totalFeesNative.toString(),
         block.totalSupply,
       ]
-    )).rows[0];
-
-    if (!result) {
-      continue;
-    }
-
-    const blockId = result.id;
-
-    // Insert unique addresses for this block
-    const allAddresses = new Map<string, 'sender' | 'receiver' | 'both'>();
-
-    for (const sender of block.senders) {
-      allAddresses.set(sender, 'sender');
-    }
-
-    for (const receiver of block.receivers) {
-      const existing = allAddresses.get(receiver);
-      if (existing === 'sender') {
-        allAddresses.set(receiver, 'both');
-      } else if (!existing) {
-        allAddresses.set(receiver, 'receiver');
-      }
-    }
-
-    // Batch insert addresses
-    for (const [address, addressType] of allAddresses) {
-      await client.query(
-        `INSERT INTO block_addresses (contract_id, block_id, address, address_type)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (block_id, address) DO NOTHING`,
-        [contractId, blockId, address, addressType]
-      );
-    }
+    );
   }
 }

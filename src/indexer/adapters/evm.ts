@@ -469,7 +469,7 @@ export class EVMAdapter implements BlockchainAdapter {
 
   /**
    * Fetch Transfer logs together with the event set's other logs in one getLogs query per span.
-   * Transfer addresses are checksummed (as stored in block_addresses); decoded arguments of
+   * Transfer addresses are checksummed; decoded arguments of
    * other events are lowercased. Without timestamps (opts.timestamps === false) every event's
    * timestamp is 0 and the caller fills it in.
    */
