@@ -490,7 +490,7 @@ export async function fetchChunk(
     allTransfers = await adapter.getTransferEvents(contractAddress, fromBlock, toBlock);
   }
 
-  const { transfers, mints, burns } = splitTransfers(allTransfers);
+  const { transfers, mints, burns } = splitTransfers(allTransfers, eventSet.transferToZeroBurns ?? true);
 
   if (transfers.length > 0 || mints.length > 0 || burns.length > 0 || others.length > 0) {
     StatusLineReporter.getInstance().log(`  Found ${transfers.length} transfers, ${mints.length} mints, ${burns.length} burns, ${others.length} other events`);

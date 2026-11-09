@@ -361,7 +361,7 @@ async function backfillContract(contract: ContractConfig, eventSet: EventSet, op
 
       const { from, to, events } = fetched;
       for (const [topic, n] of events.unknownTopics ?? []) unknownTopics.set(topic, (unknownTopics.get(topic) ?? 0) + n);
-      const source = { ...splitTransfers(events.transfers), others: events.others };
+      const source = { ...splitTransfers(events.transfers, eventSet.transferToZeroBurns ?? true), others: events.others };
       const rows = buildEventRows(source);
       const count = await withDatabaseRetry(`backfill write of blocks ${from}-${to}`, () => transaction(async (client) => {
         let n: number;

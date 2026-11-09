@@ -39,18 +39,23 @@ export function normalizeAddress(address: string | null | undefined): string | n
 
 /**
  * Split zero-address Transfers into mints and burns, keeping them out of transfers so they
- * are not double counted.
+ * are not double counted. With `transferToZeroBurns` false (Tether), a Transfer to the zero
+ * address is an ordinary transfer: the tokens still count in the supply.
  */
-export function splitTransfers(allTransfers: TransferEvent[]): { transfers: TransferEvent[]; mints: MintEvent[]; burns: BurnEvent[] } {
+export function splitTransfers(
+  allTransfers: TransferEvent[],
+  transferToZeroBurns = true
+): { transfers: TransferEvent[]; mints: MintEvent[]; burns: BurnEvent[] } {
   const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
   const isZero = (a: string) => a.toLowerCase() === ZERO_ADDRESS;
+  const isBurn = (t: TransferEvent) => transferToZeroBurns && !isZero(t.from) && isZero(t.to);
   const mints = allTransfers
     .filter(t => isZero(t.from))
     .map(t => ({ blockNumber: t.blockNumber, logIndex: t.logIndex, txHash: t.txHash, to: t.to, value: t.value, timestamp: t.timestamp }));
   const burns = allTransfers
-    .filter(t => !isZero(t.from) && isZero(t.to))
+    .filter(isBurn)
     .map(t => ({ blockNumber: t.blockNumber, logIndex: t.logIndex, txHash: t.txHash, from: t.from, value: t.value, timestamp: t.timestamp }));
-  const transfers = allTransfers.filter(t => !isZero(t.from) && !isZero(t.to));
+  const transfers = allTransfers.filter(t => !isZero(t.from) && !isBurn(t));
   return { transfers, mints, burns };
 }
 

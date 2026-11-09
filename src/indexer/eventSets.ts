@@ -10,6 +10,10 @@
  *              a zero-address Transfer (e.g. FiatToken's Mint/Burn) must NOT set this, or supply
  *              would be counted twice.
  *  - amountArg / fromArg / toArg: which decoded arguments fill events.amount/from/to
+ *
+ * transferToZeroBurns (default true) says whether a Transfer to the zero address destroys the
+ * tokens. Tether's transfer() just moves them to 0x0, where they stay in totalSupply, so for
+ * Tether those are ordinary transfers and only Redeem/DestroyedBlackFunds burn.
  */
 export type EventCategory = 'freeze' | 'minter' | 'role' | 'pause' | 'upgrade' | 'issuance' | 'config';
 
@@ -25,6 +29,7 @@ export interface EventDefinition {
 export interface EventSet {
   name: string;
   events: EventDefinition[];
+  transferToZeroBurns?: boolean;
 }
 
 const ERC20: EventSet = { name: 'erc20', events: [] };
@@ -52,9 +57,10 @@ const FIATTOKEN: EventSet = {
 };
 
 // Tether's TetherToken (USDT on Ethereum). Issue/Redeem/DestroyedBlackFunds change supply
-// without emitting a zero-address Transfer.
+// without emitting a zero-address Transfer, and a Transfer to 0x0 leaves the supply unchanged.
 const TETHER: EventSet = {
   name: 'tether',
+  transferToZeroBurns: false,
   events: [
     { abi: 'event Issue(uint256 amount)', category: 'issuance', supply: 'mint', amountArg: 'amount' },
     { abi: 'event Redeem(uint256 amount)', category: 'issuance', supply: 'burn', amountArg: 'amount' },
