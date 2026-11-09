@@ -9,6 +9,7 @@ import rpcEndpointsRouter from './routes/rpcEndpoints';
 import metaRouter from './routes/meta';
 import seriesRouter from './routes/series';
 import eventsRouter from './routes/events';
+import frozenRouter from './routes/frozen';
 
 const app = express();
 
@@ -32,6 +33,7 @@ app.use('/api/rpc-endpoints', rpcEndpointsRouter);
 app.use('/api', metaRouter);
 app.use('/api', seriesRouter);
 app.use('/api', eventsRouter);
+app.use('/api', frozenRouter);
 
 // Error handler
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {

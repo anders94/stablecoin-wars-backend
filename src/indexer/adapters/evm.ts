@@ -98,6 +98,8 @@ const TIMESTAMP_FETCH_CONCURRENCY = 8;
 const LOG_SPAN_GROW_AFTER = 20;
 // owner() selector, for contracts whose supply events implicitly credit the owner
 const OWNER_SELECTOR = '0x8da5cb5b';
+// balanceOf(address)
+const BALANCE_OF_SELECTOR = '0x70a08231';
 
 type FeeMap = Map<string, { feeNative: string; feeUsd: string | null }>;
 
@@ -392,6 +394,36 @@ export class EVMAdapter implements BlockchainAdapter {
         await sleep(INITIAL_RETRY_DELAY_MS * 2 ** attempt);
       }
     }
+  }
+
+  async getBalancesAt(token: string, holders: string[], blockNumber: number, parallel = 8): Promise<string[]> {
+    const balances: string[] = new Array(holders.length);
+    let next = 0;
+    const balanceOf = async (holder: string): Promise<string> => {
+      const data = BALANCE_OF_SELECTOR + holder.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await this.acquireRateLimitToken(`eth_call (balanceOf ${holder} @${blockNumber})`);
+          const result = await withTimeout(
+            this.getProvider().send('eth_call', [{ to: token, data }, toQuantity(blockNumber)]) as Promise<string>,
+            RPC_TIMEOUT_MS,
+            `balanceOf ${holder} @${blockNumber}`
+          );
+          if (!result || result === '0x') throw new Error(`balanceOf ${holder} returned nothing`);
+          return BigInt(result).toString();
+        } catch (error) {
+          if (attempt >= MAX_RECEIPT_RETRIES - 1 || isShutdownRequested()) throw error;
+          await sleep(INITIAL_RETRY_DELAY_MS * 2 ** attempt);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(parallel, holders.length) }, async () => {
+      while (next < holders.length) {
+        const i = next++;
+        balances[i] = await balanceOf(holders[i]);
+      }
+    }));
+    return balances;
   }
 
   // Fetch logs for a block range in pieces that stay under the node's result cap.

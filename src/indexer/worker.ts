@@ -4,6 +4,7 @@ dotenv.config();
 import { getIndexerQueue, closeQueue } from './queue';
 import { discoverContract, syncContract } from './processor';
 import { aggregateMetrics, runFullAggregation } from './aggregator';
+import { refreshFrozenIfDue } from './frozen';
 import { closePool } from '../db';
 import { StatusLineReporter } from './statusLineReporter';
 import { isShutdownRequested, requestShutdown } from './shutdown';
@@ -231,6 +232,15 @@ async function main() {
     }
   }, AGGREGATION_INTERVAL);
 
+  // Keep the frozen (blacklisted) address list current: on new freeze events, and hourly
+  const FROZEN_CHECK_INTERVAL = 10 * 60 * 1000; // 10 minutes
+  const runFrozenRefresh = () => {
+    if (isShutdownRequested()) return;
+    refreshFrozenIfDue().catch(error => console.error('Frozen address refresh failed:', error));
+  };
+  runFrozenRefresh();
+  const frozenInterval = setInterval(runFrozenRefresh, FROZEN_CHECK_INTERVAL);
+
   // Schedule continuous sync for all active contracts
   // Check every 30 seconds to keep contracts up to date
   const SYNC_INTERVAL = 30 * 1000; // 30 seconds
@@ -361,6 +371,7 @@ async function main() {
     try {
       // Stop scheduling new jobs
       clearInterval(aggregationInterval);
+      clearInterval(frozenInterval);
       clearInterval(syncInterval);
       StatusLineReporter.getInstance().log('Stopped scheduling intervals');
 

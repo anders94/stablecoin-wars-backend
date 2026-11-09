@@ -48,6 +48,9 @@ export interface BlockchainAdapter {
   // as Tether's Issue and Redeem). Optional; null when the contract has no owner().
   getOwnerAt?(address: string, blockNumber: number): Promise<string | null>;
 
+  // Token balances (base units) of several holders at one block, in the order given. Optional.
+  getBalancesAt?(token: string, holders: string[], blockNumber: number, parallel?: number): Promise<string[]>;
+
   // Every transaction fee in a block, keyed by lowercased tx hash. Optional.
   getBlockFees?(blockNumber: number): Promise<Map<string, { feeNative: string; feeUsd: string | null }>>;
 
